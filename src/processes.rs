@@ -124,7 +124,14 @@ fn is_desktop_host(item: &ProcessInfo) -> bool {
 }
 
 fn is_transient_codex_helper(item: &ProcessInfo) -> bool {
-    const MARKERS: [&str; 4] = ["command-runner", "code-mode-host", "sandbox", "apply-patch"];
+    const MARKERS: [&str; 6] = [
+        "command-runner",
+        "code-mode-host",
+        "codex-switcher",
+        "codex_switcher",
+        "sandbox",
+        "apply-patch",
+    ];
     [&item.name, &item.executable]
         .into_iter()
         .map(|value| process_stem(value))
@@ -421,5 +428,16 @@ mod tests {
             select_codex_host(&[runner, cli]),
             Some(HostProcess::new(20, 20.0, "cli"))
         );
+    }
+
+    #[test]
+    fn skips_codex_switcher_as_a_runtime_host() {
+        let switcher = process(
+            10,
+            "codex-switcher.exe",
+            r"C:\CodexSwitcher\codex-switcher.exe",
+            &["codex-switcher.exe"],
+        );
+        assert_eq!(select_codex_host(&[switcher]), None);
     }
 }

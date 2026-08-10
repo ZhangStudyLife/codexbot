@@ -272,10 +272,10 @@ impl AccountSnapshotStore {
     pub fn switch_account<F>(
         &self,
         name: &str,
-        process_checker: F,
+        mut process_checker: F,
     ) -> Result<(Option<String>, Option<String>), AccountSwitchError>
     where
-        F: FnOnce() -> Result<Vec<u32>, AccountSwitchError>,
+        F: FnMut() -> Result<Vec<u32>, AccountSwitchError>,
     {
         let running = process_checker()?;
         if !running.is_empty() {
@@ -316,6 +316,13 @@ impl AccountSnapshotStore {
 
         let encoded = serde_json::to_vec(&Value::Object(auth_json.clone()))
             .map_err(|error| AccountSwitchError::Other(format!("Codex 登录无法序列化：{error}")))?;
+        let running = process_checker()?;
+        if !running.is_empty() {
+            return Err(AccountSwitchError::Other(format!(
+                "检测到 {} 个 Codex/ChatGPT 进程重新启动，已中止账号切换。",
+                running.len()
+            )));
+        }
         write_atomic(&self.auth_path, &encoded)?;
         Ok(account_identity(&auth_json))
     }
@@ -695,5 +702,46 @@ mod tests {
         let (email, id) = account_identity(data.as_object().unwrap());
         assert_eq!(email.as_deref(), Some("nested@example.com"));
         assert_eq!(id.as_deref(), Some("nested-account"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn aborts_if_codex_restarts_before_the_auth_write() {
+        use std::cell::Cell;
+
+        let root = tempfile::tempdir().unwrap();
+        let auth_path = root.path().join("codex").join("auth.json");
+        let accounts_path = root.path().join("accounts");
+        std::fs::create_dir_all(auth_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &auth_path,
+            serde_json::to_vec(&serde_json::json!({
+                "tokens": {"account_id": "saved"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let store = AccountSnapshotStore::new(&auth_path, &accounts_path);
+        store.save_current_account("saved").unwrap();
+
+        std::fs::write(
+            &auth_path,
+            serde_json::to_vec(&serde_json::json!({
+                "tokens": {"account_id": "current"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let checks = Cell::new(0);
+        let error = store
+            .switch_account("saved", || {
+                let check = checks.get();
+                checks.set(check + 1);
+                Ok(if check == 0 { Vec::new() } else { vec![999] })
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("重新启动"));
+        let current: Value = serde_json::from_slice(&std::fs::read(&auth_path).unwrap()).unwrap();
+        assert_eq!(current["tokens"]["account_id"], "current");
     }
 }

@@ -8,6 +8,17 @@ htmlcov/
 build/
 dist/
 /target/
+ui/node_modules/
+ui/src-tauri/target/
+ui/src-tauri/gen/
+ui/src-tauri/icons/android/
+ui/src-tauri/icons/ios/
+ui/src-tauri/icons/*.icns
+ui/src-tauri/icons/64x64.png
+ui/src-tauri/icons/icon.png
+ui/src-tauri/icons/Square*.png
+ui/src-tauri/icons/StoreLogo.png
+/%SystemDrive%/
 *.egg-info/
 .mypy_cache/
 .ruff_cache/

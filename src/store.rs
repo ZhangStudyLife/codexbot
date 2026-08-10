@@ -986,6 +986,16 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?)
     }
 
+    pub fn record_host(&self, host: &HostProcess) -> StoreResult<()> {
+        self.connect()?.execute(
+            "INSERT INTO hosts(pid, create_time, kind, last_seen) VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(pid, create_time) DO UPDATE SET \
+             kind = excluded.kind, last_seen = excluded.last_seen",
+            params![host.pid, host.create_time, &host.kind, now_seconds()],
+        )?;
+        Ok(())
+    }
+
     pub fn remove_hosts(&self, hosts: &[HostProcess]) -> StoreResult<()> {
         if hosts.is_empty() {
             return Ok(());
@@ -1517,5 +1527,15 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(store.get_bound_openid().unwrap().as_deref(), Some("openid"));
+    }
+
+    #[test]
+    fn rediscovered_hosts_can_be_recorded() {
+        let root = tempdir().unwrap();
+        let store = Store::new(root.path().join("state.sqlite3")).unwrap();
+        let host = HostProcess::new(42, 123.0, "desktop");
+
+        store.record_host(&host).unwrap();
+        assert_eq!(store.list_hosts().unwrap(), vec![host]);
     }
 }

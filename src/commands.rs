@@ -12,6 +12,7 @@ use thiserror::Error;
 
 use crate::account_switch::{self, AccountSnapshot};
 use crate::codex_accounts::CodexAccountManager;
+use crate::codex_app::{AccountSwitchOutcome, switch_account_and_open};
 use crate::codex_login::{AccountInfo, AppServerError, CodexAppServerClient};
 use crate::codex_usage::{format_usage_text, parse_rate_limits, usage_dashboard_hint};
 use crate::formatting::split_text;
@@ -26,7 +27,7 @@ pub const HELP_TEXT: &str = "CodexBot QQ 命令\n\
 /account - 查看当前 Codex 账号\n\
 /account save 名称 - 保存当前 Codex 账号\n\
 /account list - 列出 codex_login 账号和加密快照\n\
-/account use 序号/名称/邮箱/ID - 安全切换账号\n\
+/account use 序号/名称/邮箱/ID - 关闭 Codex、切换账号并自动重新打开\n\
 /account delete 名称 - 删除已保存的账号\n\
 /mute - 暂停主动通知\n\
 /unmute - 恢复主动通知\n\
@@ -192,7 +193,10 @@ impl CommandService {
         if !self.store.remember_inbound(message_id)? {
             return Ok(CommandOutcome::Duplicate);
         }
-        let command = content.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut command = content.split_whitespace().collect::<Vec<_>>().join(" ");
+        if command.starts_with('\\') {
+            command.replace_range(..1, "/");
+        }
         if let Some(code) = bind_regex()
             .captures(&command)
             .and_then(|captures| captures.get(1))
@@ -305,7 +309,7 @@ impl CommandService {
                     Err(error) => account_switch_error("删除", &error),
                 }
             }
-            _ => "用法：\n/account save 名称 - 保存当前账号\n/account list - 列出 codex_login 账号和加密快照\n/account use 序号/名称/邮箱/ID - 安全切换账号\n/account delete 名称 - 删除 CodexBot 加密快照".to_owned(),
+            _ => "用法：\n/account save 名称 - 保存当前账号\n/account list - 列出 codex_login 账号和加密快照\n/account use 序号/名称/邮箱/ID - 关闭 Codex、切换并自动重新打开\n/account delete 名称 - 删除 CodexBot 加密快照".to_owned(),
         }
     }
 
@@ -364,16 +368,24 @@ impl CommandService {
             let manager = self.account_manager.clone();
             let candidate = selector.clone();
             match spawn_blocking_account(move || manager.resolve_account(&candidate)).await {
-                Ok(_) => {
+                Ok(account) => {
+                    if !account.is_ready() {
+                        return "切换 codex_login 账号失败：该账号登录已过期，请先在 codex_login 中重新认证。".to_owned();
+                    }
                     let manager = self.account_manager.clone();
                     let candidate = selector.clone();
-                    return match spawn_blocking_account(move || manager.switch_account(&candidate))
-                        .await
+                    return match spawn_blocking_account(move || {
+                        switch_account_and_open(|| manager.switch_account(&candidate))
+                    })
+                    .await
                     {
-                        Ok(account) => format!(
-                            "已切换到 codex_login 账号 {}（{}）。\n已更新 Codex 登录并同步当前账号；现在可以重新启动 Codex。",
-                            safe_field(Some(&account.name), "未知", 160),
-                            safe_field(account.email.as_deref(), "无邮箱", 160)
+                        Ok(outcome) => account_switch_success(
+                            format!(
+                                "已切换到 codex_login 账号 {}（{}）。\n已更新 Codex 登录并同步当前账号。",
+                                safe_field(Some(&outcome.value.name), "未知", 160),
+                                safe_field(outcome.value.email.as_deref(), "无邮箱", 160)
+                            ),
+                            &outcome,
                         ),
                         Err(error) => account_switch_error("切换 codex_login 账号", &error),
                     };
@@ -395,11 +407,18 @@ impl CommandService {
             }
         }
         let candidate = selector.clone();
-        match spawn_blocking_account(move || account_switch::switch_account(&candidate)).await {
-            Ok((email, _)) => format!(
-                "已切换到 CodexBot 加密快照 {}（{}）。\n已更新 Codex 登录；现在可以重新启动 Codex。",
-                safe_field(Some(&selector), "未知", 160),
-                safe_field(email.as_deref(), "未知邮箱", 160)
+        match spawn_blocking_account(move || {
+            switch_account_and_open(|| account_switch::switch_account(&candidate))
+        })
+        .await
+        {
+            Ok(outcome) => account_switch_success(
+                format!(
+                    "已切换到 CodexBot 加密快照 {}（{}）。\n已更新 Codex 登录。",
+                    safe_field(Some(&selector), "未知", 160),
+                    safe_field(outcome.value.0.as_deref(), "未知邮箱", 160)
+                ),
+                &outcome,
             ),
             Err(error) => account_switch_error("切换 CodexBot 加密快照", &error),
         }
@@ -641,12 +660,25 @@ fn status_text(store: &Store) -> Result<String, StoreError> {
 fn account_switch_error(prefix: &str, error: &str) -> String {
     let detail = safe_field(Some(error), "请稍后重试", 220);
     let mut response = format!("{prefix}失败：{detail}");
-    if detail.contains("正在运行") {
-        response.push_str(
-            "\n请先运行 .\\codexbot.cmd start 保持机器人在线，再完全退出 Codex/ChatGPT 后重试。",
-        );
+    if detail.contains("正在运行") || detail.contains("关闭 Codex") {
+        response.push_str("\n自动关闭未完成；请保存当前工作，手动退出 Codex/ChatGPT 后重试。");
     }
     response
+}
+
+fn account_switch_success<T>(base: String, outcome: &AccountSwitchOutcome<T>) -> String {
+    if outcome.app_opened {
+        if outcome.closed_processes > 0 {
+            format!(
+                "{base}\n已关闭 {} 个旧 Codex 进程，并使用新账号自动重新打开 Codex。",
+                outcome.closed_processes
+            )
+        } else {
+            format!("{base}\nCodex 已使用新账号自动打开。")
+        }
+    } else {
+        format!("{base}\n账号已切换，但未能自动打开 Codex；请手动启动 Codex。")
+    }
 }
 
 pub fn hmac_equal(left: &str, right: &str) -> bool {
@@ -664,6 +696,9 @@ pub fn hmac_equal(left: &str, right: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
+    use std::sync::Mutex;
+    use tempfile::tempdir;
 
     #[test]
     fn parses_last_arguments_compatibly() {
@@ -680,5 +715,67 @@ mod tests {
     fn constant_time_comparison_handles_different_lengths() {
         assert!(hmac_equal("owner", "owner"));
         assert!(!hmac_equal("owner", "other"));
+    }
+
+    #[test]
+    fn account_switch_reply_reports_automatic_reopen() {
+        let outcome = AccountSwitchOutcome {
+            value: (),
+            closed_processes: 2,
+            app_opened: true,
+        };
+        let reply = account_switch_success("账号已切换。".to_owned(), &outcome);
+        assert!(reply.contains("已关闭 2 个旧 Codex 进程"));
+        assert!(reply.contains("自动重新打开 Codex"));
+    }
+
+    #[test]
+    fn account_switch_reply_preserves_success_when_opening_fails() {
+        let outcome = AccountSwitchOutcome {
+            value: (),
+            closed_processes: 0,
+            app_opened: false,
+        };
+        let reply = account_switch_success("账号已切换。".to_owned(), &outcome);
+        assert!(reply.contains("账号已切换"));
+        assert!(reply.contains("请手动启动 Codex"));
+    }
+
+    #[tokio::test]
+    async fn help_replies_for_slash_and_windows_backslash_forms() {
+        let root = tempdir().unwrap();
+        let store = Arc::new(Store::new(root.path().join("state.sqlite3")).unwrap());
+        store.set_setting("bound_openid", "owner").unwrap();
+        let service = CommandService::new(store);
+        let replies = Arc::new(Mutex::new(Vec::new()));
+
+        for (message_id, content) in [("message-1", "/help"), ("message-2", r"\help")] {
+            let captured = Arc::clone(&replies);
+            let outcome = service
+                .handle(
+                    "owner",
+                    message_id,
+                    content,
+                    move |target, text, source_id, sequence| {
+                        let captured = Arc::clone(&captured);
+                        async move {
+                            captured
+                                .lock()
+                                .unwrap()
+                                .push((target, text, source_id, sequence));
+                            Ok::<(), io::Error>(())
+                        }
+                    },
+                    |_target, _text| async { Ok::<(), io::Error>(()) },
+                )
+                .await
+                .unwrap();
+            assert_eq!(outcome, CommandOutcome::Replied);
+        }
+
+        let replies = replies.lock().unwrap();
+        assert_eq!(replies.len(), 2);
+        assert!(replies.iter().all(|reply| reply.1 == HELP_TEXT));
+        assert!(replies.iter().all(|reply| reply.3 == 1));
     }
 }

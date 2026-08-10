@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::commands::CommandService;
 use crate::delivery::{DeliveryOutcome, RateLimiter, deliver_item};
 use crate::logging_utils::ProcessSafeLogger;
-use crate::processes::process_matches;
+use crate::processes::{discover_running_codex_host, process_matches};
 use crate::security::{Credentials, redact_secrets};
 use crate::store::{Store, StoreError};
 
@@ -25,6 +25,7 @@ pub const HOSTLESS_STARTUP_GRACE: Duration = Duration::from_secs(15);
 pub const DEFAULT_MONITOR_INTERVAL: Duration = Duration::from_secs(1);
 pub const DEFAULT_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 pub const DEFAULT_RECONNECT_DELAY: Duration = Duration::from_secs(3);
+pub const DEFAULT_HOST_REATTACH_GRACE: Duration = Duration::from_secs(15);
 pub const QQ_TOKEN_ENDPOINT: &str = "https://bots.qq.com/app/getAppAccessToken";
 pub const QQ_API_BASE: &str = "https://sandbox.api.sgroup.qq.com";
 const QQ_C2C_INTENT: u64 = 1 << 25;
@@ -36,6 +37,7 @@ pub struct QQRuntimeOptions {
     pub monitor_interval: Duration,
     pub empty_host_checks: u32,
     pub hostless_startup_grace: Duration,
+    pub host_reattach_grace: Duration,
     pub shutdown_drain_timeout: Duration,
 }
 
@@ -47,6 +49,7 @@ impl Default for QQRuntimeOptions {
             monitor_interval: DEFAULT_MONITOR_INTERVAL,
             empty_host_checks: 2,
             hostless_startup_grace: HOSTLESS_STARTUP_GRACE,
+            host_reattach_grace: DEFAULT_HOST_REATTACH_GRACE,
             shutdown_drain_timeout: DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
         }
     }
@@ -212,17 +215,14 @@ impl QQApiClient {
         &self,
         openid: &str,
         content: &str,
-        message_id: Option<&str>,
+        reply_to: Option<(&str, u32)>,
     ) -> Result<(), QQApiError> {
         let token = self.access_token().await.map_err(|error| QQApiError {
             code: None,
             status: None,
             message: safe_detail(&error.to_string()),
         })?;
-        let mut payload = json!({"msg_type": 0, "content": content});
-        if let (Some(payload), Some(message_id)) = (payload.as_object_mut(), message_id) {
-            payload.insert("msg_id".to_owned(), Value::String(message_id.to_owned()));
-        }
+        let payload = c2c_message_payload(content, reply_to);
         let response = self
             .http
             .post(format!("{QQ_API_BASE}/v2/users/{openid}/messages"))
@@ -248,6 +248,15 @@ impl QQApiClient {
             Err(QQApiError::from_response(status, &body))
         }
     }
+}
+
+fn c2c_message_payload(content: &str, reply_to: Option<(&str, u32)>) -> Value {
+    let mut payload = json!({"msg_type": 0, "content": content});
+    if let (Some(payload), Some((message_id, sequence))) = (payload.as_object_mut(), reply_to) {
+        payload.insert("msg_id".to_owned(), Value::String(message_id.to_owned()));
+        payload.insert("msg_seq".to_owned(), Value::from(sequence));
+    }
+    payload
 }
 
 impl QQApiError {
@@ -387,6 +396,7 @@ impl QQRuntime {
     async fn monitor_hosts(self) -> Result<(), QQRuntimeError> {
         let started = Instant::now();
         let mut empty_checks = 0_u32;
+        let mut hostless_since: Option<Instant> = None;
         while !self.is_stopping() {
             let hosts = self.store.list_hosts()?;
             let dead: Vec<_> = hosts
@@ -397,7 +407,17 @@ impl QQRuntime {
             if !dead.is_empty() {
                 self.store.remove_hosts(&dead)?;
             }
-            let alive_count = hosts.len().saturating_sub(dead.len());
+            let mut alive_count = hosts.len().saturating_sub(dead.len());
+            if alive_count == 0 {
+                if let Some(host) = discover_running_codex_host() {
+                    self.store.record_host(&host)?;
+                    alive_count = 1;
+                    self.log_info(&format!(
+                        "Reattached companion to running Codex host PID {}",
+                        host.pid
+                    ));
+                }
+            }
             let pending_work = self.store.companion_work_pending()?;
             if self.options.standalone {
                 self.interruptible_sleep(self.options.monitor_interval)
@@ -409,7 +429,14 @@ impl QQRuntime {
                 || (!self.is_ready() && started.elapsed() < self.options.hostless_startup_grace)
             {
                 empty_checks = 0;
+                hostless_since = None;
             } else {
+                let missing_since = *hostless_since.get_or_insert_with(Instant::now);
+                if missing_since.elapsed() < self.options.host_reattach_grace {
+                    self.interruptible_sleep(self.options.monitor_interval)
+                        .await;
+                    continue;
+                }
                 empty_checks += 1;
                 if empty_checks >= self.options.empty_host_checks.max(1) {
                     self.log_info("No Codex host remains; stopping companion");
@@ -577,9 +604,12 @@ impl QQRuntime {
                 &openid,
                 &message_id,
                 &content,
-                move |target, text, source_id, _sequence| {
+                move |target, text, source_id, sequence| {
                     let api = passive_api.clone();
-                    async move { api.post_c2c_message(&target, &text, Some(&source_id)).await }
+                    async move {
+                        api.post_c2c_message(&target, &text, Some((&source_id, sequence)))
+                            .await
+                    }
                 },
                 move |target, text| {
                     let api = active_api.clone();
@@ -838,6 +868,22 @@ mod tests {
     fn gateway_text_is_decoded_as_json() {
         let value = message_json(Message::Text(r#"{"op":10,"d":{}}"#.into())).unwrap();
         assert_eq!(value["op"], 10);
+    }
+
+    #[test]
+    fn passive_reply_payload_includes_qq_deduplication_sequence() {
+        let payload = c2c_message_payload("help", Some(("message-1", 1)));
+        assert_eq!(payload["msg_type"], 0);
+        assert_eq!(payload["content"], "help");
+        assert_eq!(payload["msg_id"], "message-1");
+        assert_eq!(payload["msg_seq"], 1);
+    }
+
+    #[test]
+    fn proactive_payload_has_no_passive_reply_fields() {
+        let payload = c2c_message_payload("notice", None);
+        assert!(payload.get("msg_id").is_none());
+        assert!(payload.get("msg_seq").is_none());
     }
 
     #[tokio::test]

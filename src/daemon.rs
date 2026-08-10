@@ -15,8 +15,13 @@ use sysinfo::{Pid, ProcessesToUpdate, System};
 use tokio::sync::watch;
 
 pub const CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+pub const STANDALONE_SETTING: &str = "daemon_standalone";
 const CREDENTIAL_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const EMPTY_HOST_CHECKS: u32 = 2;
+
+fn standalone_requested(environment: Option<&str>, stored: Option<&str>) -> bool {
+    environment == Some("1") || stored == Some("1")
+}
 
 fn safe_detail(error: &dyn std::fmt::Display) -> String {
     redact_secrets(&error.to_string())
@@ -187,7 +192,9 @@ pub async fn run() -> Result<i32> {
     let logger = configure_logging("codexbot.daemon", false)
         .context("failed to configure daemon logging")?;
     let store = Arc::new(Store::new(database_path()).context("failed to open state store")?);
-    let standalone = env::var("CODEXBOT_STANDALONE").as_deref() == Ok("1");
+    let environment_mode = env::var("CODEXBOT_STANDALONE").ok();
+    let stored_mode = store.get_setting(STANDALONE_SETTING)?;
+    let standalone = standalone_requested(environment_mode.as_deref(), stored_mode.as_deref());
     if standalone {
         let _ = logger.info("Running as a standalone companion (CODEXBOT_STANDALONE=1)");
     }
@@ -261,5 +268,12 @@ mod tests {
         assert!(!detail.contains("daemon-secret"));
         assert!(detail.contains("[REDACTED]"));
         assert!(detail.chars().count() <= 300);
+    }
+
+    #[test]
+    fn persisted_standalone_mode_survives_a_hook_restart() {
+        assert!(standalone_requested(Some("0"), Some("1")));
+        assert!(standalone_requested(Some("1"), None));
+        assert!(!standalone_requested(Some("0"), None));
     }
 }

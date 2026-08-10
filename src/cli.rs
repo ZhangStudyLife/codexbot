@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 use serde_json::Value;
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
+use crate::daemon::STANDALONE_SETTING;
 use crate::installer::{
     PERMISSION_NOTIFICATION_ENV, find_codex_command, install_personal_plugin,
     marketplace_contains_plugin,
@@ -21,8 +22,6 @@ use crate::security::{
 };
 use crate::store::Store;
 use crate::subprocess_utils::hide_console_window;
-
-const STANDALONE_SETTING: &str = "daemon_standalone";
 
 #[derive(Debug, Parser)]
 #[command(name = "codexbot", version, about = "Codex → QQ 官方沙箱通知机器人")]

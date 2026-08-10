@@ -41,7 +41,7 @@ CodexBot 是一个运行在 Windows 本机的 Codex 生命周期通知桥接器�
 - 可靠投递：SQLite WAL、本地 outbox、速率限制、重试、分段和永久错误处理。
 - Codex 账号与用量：通过本机 app-server 读取账号/套餐和所有限额 bucket；兼容 Codex Switcher（`codex_login`）保存的多账号，并显示限额剩余百分比、窗口和重置时间。
 - 隐私保护：AppSecret 存放在 Windows Credential Manager；提示词预览、错误和日志中的常见密钥会脱敏。
-- 账号安全：CodexBot 不会把 `codex_login` 中的 token 复制到数据库、日志或 QQ。切换前会确认 Codex/ChatGPT 已完全退出，再原子替换 `CODEX_HOME\auth.json`、同步 `accounts.json` 的当前账号；同步失败会恢复原登录。CodexBot 自有快照继续使用 Windows DPAPI 加密存放在 `%LOCALAPPDATA%\CodexBot\accounts`。
+- 账号安全：CodexBot 不会把 `codex_login` 中的 token 复制到数据库、日志或 QQ。切换时会先关闭正在运行的 Codex/ChatGPT，原子替换 `CODEX_HOME\auth.json`、同步 `accounts.json` 的当前账号，再自动重新打开 Codex；同步失败会恢复原登录，并尽力重新打开原会话。CodexBot 自有快照继续使用 Windows DPAPI 加密存放在 `%LOCALAPPDATA%\CodexBot\accounts`。
 - 受限控制：不调用 OpenAI API，不创建第二个 Codex/ChatGPT 会话；QQ 只能触发文档列出的账号切换与通知命令，不能执行任意命令或代替本机审批。
 
 ### 环境要求
@@ -84,6 +84,16 @@ cd codexbot
 .\codexbot.cmd pair
 ```
 
+#### Windows 图形桌面版
+
+`ui/` 提供与原生运行时共用数据和凭据的 Tauri 2 桌面控制台，可配置 QQ 凭据、安装或修复 Codex 插件、启停桥接服务、生成配对码并查看连接状态。从源码构建安装版和便携版：
+
+```bat
+.\build-windows.cmd
+```
+
+构建产物写入本地 `dist\` 目录；该目录不会提交到 GitHub。桌面程序不会把 AppSecret 返回给前端，凭据仍只保存在 Windows Credential Manager。
+
 ### 检查安装状态
 
 ```bat
@@ -116,7 +126,7 @@ cd codexbot
 | `/account` | 查看当前 Codex 邮箱、套餐和认证类型 |
 | `/account save 名称` | 把当前 Codex 账号保存为加密快照 |
 | `/account list` | 列出 `codex_login` 保存的账号和 CodexBot 加密快照 |
-| `/account use 序号/名称/邮箱/ID` | 切换 `codex_login` 账号；也兼容按名称使用 CodexBot 快照 |
+| `/account use 序号/名称/邮箱/ID` | 关闭运行中的 Codex，切换 `codex_login` 账号或 CodexBot 快照，然后自动重新打开 Codex |
 | `/account delete 名称` | 删除已保存的账号快照 |
 | `/mute` | 暂停未来的主动通知，不补发静音期间的旧消息 |
 | `/unmute` | 恢复未来的主动通知 |
@@ -162,9 +172,11 @@ cd codexbot
 
 `/usage` 在未登录、API key 或旧版 Codex 时会清晰降级，并提供官方用量面板：<https://chatgpt.com/codex/settings/usage>。这些账号与限额查询不会启动模型推理，因此不会额外消耗 Codex 推理 token。
 
-`/account list` 会读取 Codex Switcher 默认的 `%USERPROFILE%\.codex-switcher\accounts.json`（可用 `CODEX_SWITCHER_HOME` 覆盖）。切换严格尊重 `CODEX_HOME`。为防止正在运行的 Codex 缓存或回写旧凭据，必须先运行 `.\codexbot.cmd start` 让 QQ 机器人常驻，再完全退出所有 Codex/ChatGPT 窗口，最后发送 `/account use ...`；成功后重新启动 Codex 即可。
+`/account list` 会读取 Codex Switcher 默认的 `%USERPROFILE%\.codex-switcher\accounts.json`（可用 `CODEX_SWITCHER_HOME` 覆盖）。切换严格尊重 `CODEX_HOME`。发送 `/account use ...` 后，CodexBot 会先请求运行中的 Codex/ChatGPT 退出；超时后才强制结束残留进程，完成原子账号切换后自动重新打开 Codex。该操作会中断正在执行的 Codex 任务，请先保存或结束当前工作。
 
 ### 截图
+
+![CodexBot Windows 桌面控制台](docs/images/codexbot-dashboard.png)
 
 ![Codex Hooks 配置](docs/images/codex-hooks.png)
 
@@ -214,7 +226,7 @@ CodexBot is a Windows companion that observes Codex lifecycle hooks, stores even
 - SQLite WAL, retries, rate limiting, adaptive message splitting, and permanent-error handling.
 - Codex account and usage commands through the local app-server, plus multi-account compatibility with accounts saved by Codex Switcher (`codex_login`).
 - AppSecret stored in Windows Credential Manager; common secrets are redacted from previews, errors, and logs.
-- CodexBot never copies tokens from `codex_login` into SQLite, logs, or QQ. Switching requires Codex/ChatGPT to be closed, atomically updates `CODEX_HOME\auth.json`, synchronizes the active account in `accounts.json`, and rolls back on synchronization failure. CodexBot's own optional snapshots remain DPAPI-encrypted under `%LOCALAPPDATA%\CodexBot\accounts`.
+- CodexBot never copies tokens from `codex_login` into SQLite, logs, or QQ. Switching first closes running Codex/ChatGPT processes, atomically updates `CODEX_HOME\auth.json`, synchronizes the active account in `accounts.json`, and reopens Codex automatically. Synchronization failures roll back the login and attempt to reopen the previous session. CodexBot's own optional snapshots remain DPAPI-encrypted under `%LOCALAPPDATA%\CodexBot\accounts`.
 - Full replies and queued notification payloads are retained locally for at most 7 days by default; `CODEXBOT_LAST_REPLY_TTL_SECONDS` and `CODEXBOT_OUTBOX_TTL_SECONDS` can override that window.
 - No OpenAI API calls or second Codex/ChatGPT session. QQ exposes only the documented account-switch and notification commands, never arbitrary command execution or local approval control.
 
@@ -252,6 +264,16 @@ Regenerate a pairing code with:
 .\codexbot.cmd pair
 ```
 
+#### Windows desktop UI
+
+The Tauri 2 control center under `ui/` shares the native runtime's local state and credentials. It configures QQ credentials, installs or repairs the Codex plugin, controls the bridge, creates pairing codes, and shows connection health. Build the installer and portable executable with:
+
+```bat
+.\build-windows.cmd
+```
+
+Artifacts are written to the ignored local `dist\` directory. AppSecret never returns to the frontend and remains in Windows Credential Manager.
+
 ### Commands
 
 | Command | Purpose |
@@ -263,7 +285,7 @@ Regenerate a pairing code with:
 | `/account` | Show the current Codex email, plan, and authentication type |
 | `/account save 名称` | Save the active Codex account as an encrypted snapshot |
 | `/account list` | List `codex_login` accounts and CodexBot encrypted snapshots |
-| `/account use selector` | Switch by index, name, email, or ID; snapshot names remain supported |
+| `/account use selector` | Close running Codex processes, switch by index/name/email/ID or snapshot name, then reopen Codex automatically |
 | `/account delete 名称` | Delete a saved account snapshot |
 | `/mute` | Pause future proactive notifications without backfilling old ones |
 | `/unmute` | Resume future proactive notifications |
@@ -293,10 +315,11 @@ Runtime data is stored under `%LOCALAPPDATA%\CodexBot`. QQ credentials stay in W
 
 To keep `/last` and final notifications complete, CodexBot stores the final reply verbatim in the local database and sends it only to the single bound QQ user; it does not rewrite token-like source-code variables. Final replies expire after seven days by default, but you should still avoid asking Codex to print real secrets.
 
-Account and rate-limit reads do not start model inference and therefore add no Codex inference-token usage. `/account list` reads Codex Switcher's default `%USERPROFILE%\.codex-switcher\accounts.json` (override with `CODEX_SWITCHER_HOME`), while account activation honors `CODEX_HOME`. To switch safely from QQ, first run `.\codexbot.cmd start`, fully close Codex/ChatGPT, send `/account use ...`, and then launch Codex again.
+Account and rate-limit reads do not start model inference and therefore add no Codex inference-token usage. `/account list` reads Codex Switcher's default `%USERPROFILE%\.codex-switcher\accounts.json` (override with `CODEX_SWITCHER_HOME`), while account activation honors `CODEX_HOME`. `/account use ...` asks running Codex/ChatGPT processes to exit, force-closes only the processes that remain, performs the atomic account switch, and reopens Codex automatically. Because this interrupts active Codex work, finish or save it before switching.
 
 ### Related documentation
 
+- [Codex Switcher reference implementation](https://github.com/LeaningLearner/codex-switcher)
 - [Codex app-server](https://developers.openai.com/codex/app-server/)
 - [Codex authentication](https://developers.openai.com/codex/auth/)
 - [Codex CLI](https://developers.openai.com/codex/cli/)

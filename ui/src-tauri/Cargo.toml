@@ -1,0 +1,25 @@
+[package]
+name = "codexbot-desktop"
+version = "0.1.0"
+description = "Desktop control center for the Codex to QQ bridge"
+edition = "2024"
+default-run = "codexbot-desktop"
+
+[lib]
+name = "codexbot_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow = "1"
+codexbot = { path = "../.." }
+serde = { version = "1", features = ["derive"] }
+sysinfo = "0.33"
+tauri = { version = "2.10", features = [] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+zeroize = { version = "1.8", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -93,6 +93,17 @@ pub fn main_menu(running: usize) -> MenuReply {
     )
 }
 
+pub fn task_notification_keyboard(thread_id: &str, can_continue: bool) -> Value {
+    let mut first_row = vec![MenuButton::new("查看任务", format!("/task {thread_id}"))];
+    if can_continue {
+        first_row.push(MenuButton::new(
+            "继续任务",
+            format!("/continue {thread_id}"),
+        ));
+    }
+    keyboard(vec![first_row, vec![MenuButton::new("新建任务", "/new")]])
+}
+
 pub fn keyboard(rows: Vec<Vec<MenuButton>>) -> Value {
     let rows = rows
         .into_iter()

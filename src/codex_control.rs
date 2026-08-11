@@ -29,6 +29,9 @@ pub struct ThreadInfo {
     pub status: String,
     pub updated_at: i64,
     pub turn_id: Option<String>,
+    pub last_output: Option<String>,
+    pub last_prompt: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,13 +197,29 @@ impl CodexControlRuntime {
                 json!({"limit": limit.min(100), "sortKey": "updated_at", "sortDirection": "desc"}),
             )
             .await?;
-        Ok(payload
+        let threads = payload
             .get("data")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
             .filter_map(parse_thread)
-            .collect())
+            .collect::<Vec<_>>();
+        for thread in &threads {
+            let Some(task) = self.store.get_qq_task(&thread.id)? else {
+                continue;
+            };
+            if task.state == "active" && !matches!(thread.status.as_str(), "active" | "inProgress")
+            {
+                let state = match thread.status.as_str() {
+                    "failed" | "systemError" => "failed",
+                    "interrupted" => "interrupted",
+                    _ => "completed",
+                };
+                self.store
+                    .update_qq_task_state(&thread.id, &task.turn_id, state)?;
+            }
+        }
+        Ok(threads)
     }
 
     pub async fn read_thread(&self, thread_id: &str) -> Result<ThreadInfo, ControlError> {
@@ -385,6 +404,16 @@ fn turn_start_params(thread_id: &str, cwd: &str, model: &str, effort: &str, prom
 fn parse_thread(value: &Value) -> Option<ThreadInfo> {
     let turns = value.get("turns").and_then(Value::as_array);
     let last_turn = turns.and_then(|turns| turns.last());
+    let items = turns
+        .into_iter()
+        .flatten()
+        .flat_map(|turn| {
+            turn.get("items")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .collect::<Vec<_>>();
     let thread_status = value
         .pointer("/status/type")
         .and_then(Value::as_str)
@@ -409,6 +438,38 @@ fn parse_thread(value: &Value) -> Option<ThreadInfo> {
             .unwrap_or_default(),
         turn_id: last_turn
             .and_then(|turn| turn.get("id"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        last_output: items.iter().rev().find_map(|item| {
+            (item.get("type").and_then(Value::as_str) == Some("agentMessage"))
+                .then(|| {
+                    item.get("text")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+                .flatten()
+        }),
+        last_prompt: items.iter().rev().find_map(|item| {
+            if item.get("type").and_then(Value::as_str) != Some("userMessage") {
+                return None;
+            }
+            item.get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find_map(|content| {
+                    (content.get("type").and_then(Value::as_str) == Some("text"))
+                        .then(|| {
+                            content
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .map(ToOwned::to_owned)
+                        })
+                        .flatten()
+                })
+        }),
+        error: last_turn
+            .and_then(|turn| turn.pointer("/error/message"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
     })
@@ -444,5 +505,29 @@ mod tests {
             "turns": []
         });
         assert_eq!(parse_thread(&value).unwrap().status, "active");
+    }
+
+    #[test]
+    fn parses_latest_prompt_output_and_error() {
+        let value = json!({
+            "id": "thread-1",
+            "cwd": "E:\\work",
+            "preview": "hello",
+            "status": {"type": "idle"},
+            "updatedAt": 7,
+            "turns": [{
+                "id": "turn-1",
+                "status": "failed",
+                "error": {"message": "capacity"},
+                "items": [
+                    {"id": "u", "type": "userMessage", "content": [{"type": "text", "text": "do it"}]},
+                    {"id": "a", "type": "agentMessage", "text": "partial"}
+                ]
+            }]
+        });
+        let thread = parse_thread(&value).unwrap();
+        assert_eq!(thread.last_prompt.as_deref(), Some("do it"));
+        assert_eq!(thread.last_output.as_deref(), Some("partial"));
+        assert_eq!(thread.error.as_deref(), Some("capacity"));
     }
 }

@@ -2,6 +2,7 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -97,6 +98,7 @@ impl ControlSession {
             || command.starts_with("/tasks")
             || command.starts_with("/task ")
             || command.starts_with("/continue ")
+            || command.starts_with("/retry ")
             || command.starts_with("/steer ")
             || command.starts_with("/stop ")
             || command.starts_with("/ui ")
@@ -124,6 +126,8 @@ impl ControlSession {
             self.task_detail(thread_id.trim()).await
         } else if let Some(thread_id) = command.strip_prefix("/continue ") {
             self.await_continue(thread_id.trim()).await
+        } else if let Some(thread_id) = command.strip_prefix("/retry ") {
+            self.retry_task(thread_id.trim()).await
         } else if let Some(arguments) = command.strip_prefix("/steer ") {
             self.await_steer(arguments).await
         } else if let Some(arguments) = command.strip_prefix("/stop ") {
@@ -156,26 +160,33 @@ impl ControlSession {
 
     async fn begin_new(&self) -> Result<MenuReply, ControlError> {
         let threads = self.codex.list_threads(20).await?;
-        let mut directories = Vec::new();
+        let mut directories = self
+            .store
+            .list_favorite_directories()?
+            .into_iter()
+            .filter(|cwd| Path::new(cwd).is_dir())
+            .take(3)
+            .map(|cwd| (format!("★ {}", shorten(&cwd, 20)), cwd))
+            .collect::<Vec<_>>();
         for thread in threads {
-            if !directories.iter().any(|cwd| cwd == &thread.cwd) && Path::new(&thread.cwd).is_dir()
+            if !directories.iter().any(|(_, cwd)| cwd == &thread.cwd)
+                && Path::new(&thread.cwd).is_dir()
             {
-                directories.push(thread.cwd);
+                directories.push((shorten(&thread.cwd, 24), thread.cwd));
             }
-            if directories.len() == 4 {
+            if directories.len() == 6 {
                 break;
             }
         }
-        let mut rows = directories
+        let buttons = directories
             .iter()
-            .map(|cwd| {
-                vec![MenuButton::new(
-                    shorten(cwd, 24),
-                    format!("/ui cwd {}", encode(cwd)),
-                )]
-            })
-            .collect::<Vec<_>>();
-        rows.push(vec![MenuButton::new("输入绝对路径", "/ui path")]);
+            .map(|(label, cwd)| MenuButton::new(label, format!("/ui cwd {}", encode(cwd))))
+            .collect();
+        let mut rows = button_rows(buttons, 2);
+        rows.push(vec![
+            MenuButton::new("浏览磁盘", "/ui drives"),
+            MenuButton::new("输入绝对路径", "/ui path"),
+        ]);
         rows.push(vec![MenuButton::new("取消", "/cancel")]);
         let mut wizard = self.wizard.lock().await;
         wizard.reset();
@@ -198,6 +209,9 @@ impl ControlSession {
         if arguments == "models" {
             return self.model_menu().await;
         }
+        if arguments == "drives" {
+            return self.browse_drives();
+        }
         if arguments == "last" {
             return self.use_last_config().await;
         }
@@ -206,6 +220,12 @@ impl ControlSession {
         }
         if let Some(encoded) = arguments.strip_prefix("cwd ") {
             return self.select_path(&decode(encoded)?).await;
+        }
+        if let Some(encoded) = arguments.strip_prefix("browse ") {
+            return self.browse_path(&decode(encoded)?);
+        }
+        if let Some(encoded) = arguments.strip_prefix("favorite ") {
+            return self.favorite_path(&decode(encoded)?);
         }
         if let Some(encoded) = arguments.strip_prefix("model ") {
             return self.select_model(&decode(encoded)?).await;
@@ -276,18 +296,19 @@ impl ControlSession {
         if models.is_empty() {
             return Err(ControlError::InvalidResponse("model/list"));
         }
-        let rows = models
+        let buttons = models
             .into_iter()
             .take(8)
             .map(|model| {
                 let marker = if model.is_default { "（默认）" } else { "" };
-                vec![MenuButton::new(
+                MenuButton::new(
                     format!("{}{}", model.display_name, marker),
                     format!("/ui model {}", encode(&model.model)),
-                )]
+                )
             })
-            .chain(std::iter::once(vec![MenuButton::new("取消", "/cancel")]))
             .collect();
+        let mut rows = button_rows(buttons, 2);
+        rows.push(vec![MenuButton::new("取消", "/cancel")]);
         Ok(MenuReply::menu("选择模型", rows))
     }
 
@@ -330,18 +351,17 @@ impl ControlSession {
         } else {
             model.efforts
         };
+        let buttons = efforts
+            .into_iter()
+            .map(|effort| {
+                MenuButton::new(effort.clone(), format!("/ui effort {}", encode(&effort)))
+            })
+            .collect();
+        let mut rows = button_rows(buttons, 2);
+        rows.push(vec![MenuButton::new("取消", "/cancel")]);
         Ok(MenuReply::menu(
             format!("模型：{}\n选择推理强度", model.display_name),
-            efforts
-                .into_iter()
-                .map(|effort| {
-                    vec![MenuButton::new(
-                        effort.clone(),
-                        format!("/ui effort {}", encode(&effort)),
-                    )]
-                })
-                .chain(std::iter::once(vec![MenuButton::new("取消", "/cancel")]))
-                .collect(),
+            rows,
         ))
     }
 
@@ -442,15 +462,13 @@ impl ControlSession {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let mut rows = threads
+        let buttons = threads
             .iter()
             .map(|thread| {
-                vec![MenuButton::new(
-                    shorten(&thread.preview, 22),
-                    format!("/task {}", thread.id),
-                )]
+                MenuButton::new(shorten(&thread.preview, 22), format!("/task {}", thread.id))
             })
             .collect::<Vec<_>>();
+        let mut rows = button_rows(buttons, 2);
         rows.push(vec![MenuButton::new("返回主菜单", "/menu")]);
         Ok(MenuReply::menu(text, rows))
     }
@@ -470,7 +488,16 @@ impl ControlSession {
                 "继续任务",
                 format!("/continue {}", thread.id),
             )]);
+            if thread.status == "failed" && thread.last_prompt.is_some() {
+                rows.last_mut()
+                    .expect("continue row exists")
+                    .push(MenuButton::new("重试任务", format!("/retry {}", thread.id)));
+            }
         }
+        rows.push(vec![
+            MenuButton::new("同目录新建", format!("/ui cwd {}", encode(&thread.cwd))),
+            MenuButton::new("收藏目录", format!("/ui favorite {}", encode(&thread.cwd))),
+        ]);
         rows.push(vec![
             MenuButton::new("刷新", format!("/task {}", thread.id)),
             MenuButton::new("任务列表", "/tasks"),
@@ -501,6 +528,14 @@ impl ControlSession {
                 format!("/task {}", task.thread_id),
             )]],
         ))
+    }
+
+    async fn retry_task(&self, thread_id: &str) -> Result<MenuReply, ControlError> {
+        let thread = self.codex.read_thread(thread_id).await?;
+        let prompt = thread
+            .last_prompt
+            .ok_or(ControlError::InvalidResponse("last user prompt"))?;
+        self.continue_task(thread_id, &prompt).await
     }
 
     async fn await_steer(&self, arguments: &str) -> Result<MenuReply, ControlError> {
@@ -553,6 +588,74 @@ impl ControlSession {
             )]],
         ))
     }
+
+    fn browse_drives(&self) -> Result<MenuReply, ControlError> {
+        let buttons = drive_roots()
+            .into_iter()
+            .take(8)
+            .map(|drive| MenuButton::new(drive.clone(), format!("/ui browse {}", encode(&drive))))
+            .collect();
+        let mut rows = button_rows(buttons, 2);
+        rows.push(vec![MenuButton::new("返回目录选择", "/new")]);
+        Ok(MenuReply::menu("选择磁盘", rows))
+    }
+
+    fn browse_path(&self, cwd: &str) -> Result<MenuReply, ControlError> {
+        let path = Path::new(cwd);
+        if !path.is_absolute() || !path.is_dir() {
+            return Ok(MenuReply::text("目录不存在或无法读取，请返回重新选择。"));
+        }
+        let buttons = subdirectories(path, 6)
+            .into_iter()
+            .map(|directory| {
+                let value = directory.to_string_lossy().into_owned();
+                let label = directory
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(&value)
+                    .to_owned();
+                MenuButton::new(label, format!("/ui browse {}", encode(&value)))
+            })
+            .collect();
+        let mut rows = button_rows(buttons, 2);
+        let mut controls = vec![MenuButton::new(
+            "使用此目录",
+            format!("/ui cwd {}", encode(cwd)),
+        )];
+        if let Some(parent) = path.parent().filter(|parent| parent.is_dir()) {
+            let parent = parent.to_string_lossy();
+            controls.push(MenuButton::new(
+                "上一级",
+                format!("/ui browse {}", encode(&parent)),
+            ));
+        }
+        rows.push(controls);
+        rows.push(vec![
+            MenuButton::new("收藏此目录", format!("/ui favorite {}", encode(cwd))),
+            MenuButton::new("返回磁盘", "/ui drives"),
+        ]);
+        Ok(MenuReply::menu(
+            format!("浏览目录：{}", shorten(cwd, 100)),
+            rows,
+        ))
+    }
+
+    fn favorite_path(&self, cwd: &str) -> Result<MenuReply, ControlError> {
+        if !Path::new(cwd).is_dir() {
+            return Ok(MenuReply::text("目录不存在，无法收藏。"));
+        }
+        self.store.add_favorite_directory(cwd)?;
+        Ok(MenuReply::menu(
+            format!("已收藏目录：{}", shorten(cwd, 100)),
+            vec![
+                vec![MenuButton::new(
+                    "使用此目录",
+                    format!("/ui cwd {}", encode(cwd)),
+                )],
+                vec![MenuButton::new("返回主菜单", "/menu")],
+            ],
+        ))
+    }
 }
 
 fn valid_saved_model<'a>(
@@ -568,13 +671,53 @@ fn valid_saved_model<'a>(
 }
 
 fn task_text(thread: &ThreadInfo) -> String {
-    format!(
+    let mut text = format!(
         "任务：{}\n状态：{}\n目录：{}\n任务 ID：{}",
         shorten(&thread.preview, 100),
         status_text(&thread.status),
         thread.cwd,
         thread.id
-    )
+    );
+    if let Some(error) = thread.error.as_deref() {
+        text.push_str(&format!("\n错误：{}", shorten(error, 400)));
+    } else if let Some(output) = thread.last_output.as_deref() {
+        text.push_str(&format!("\n最新输出：{}", shorten(output, 500)));
+    }
+    text
+}
+
+fn button_rows(buttons: Vec<MenuButton>, per_row: usize) -> Vec<Vec<MenuButton>> {
+    buttons
+        .chunks(per_row.max(1))
+        .map(|chunk| chunk.to_vec())
+        .collect()
+}
+
+fn drive_roots() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        (b'A'..=b'Z')
+            .map(|letter| format!("{}:\\", char::from(letter)))
+            .filter(|path| Path::new(path).is_dir())
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        vec!["/".to_owned()]
+    }
+}
+
+fn subdirectories(path: &Path, limit: usize) -> Vec<std::path::PathBuf> {
+    let mut directories = fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    directories.sort_by_key(|path| path.to_string_lossy().to_lowercase());
+    directories.truncate(limit);
+    directories
 }
 
 fn status_text(status: &str) -> &str {
@@ -650,5 +793,14 @@ mod tests {
     fn menu_values_round_trip_windows_paths() {
         let path = r"E:\Codex Workspace\Demo";
         assert_eq!(decode(&encode(path)).unwrap(), path);
+    }
+
+    #[test]
+    fn buttons_are_packed_into_keyboard_rows() {
+        let buttons = (0..5)
+            .map(|index| MenuButton::new(index.to_string(), "/menu"))
+            .collect();
+        let rows = button_rows(buttons, 2);
+        assert_eq!(rows.iter().map(Vec::len).collect::<Vec<_>>(), [2, 2, 1]);
     }
 }

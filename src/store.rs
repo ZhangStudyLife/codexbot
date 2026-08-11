@@ -312,6 +312,11 @@ impl Store {
                 state TEXT NOT NULL,
                 updated_at REAL NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS favorite_directories (
+                path TEXT PRIMARY KEY,
+                updated_at REAL NOT NULL
+            );
             "#,
         )?;
         Self::migrate_last_reply(&connection)?;
@@ -806,6 +811,13 @@ impl Store {
             _ => {}
         }
 
+        if let Some(payload) = payload.as_mut().and_then(Value::as_object_mut) {
+            payload.insert(
+                "thread_id".to_owned(),
+                Value::String(raw_session_id.clone()),
+            );
+        }
+
         let event_key = Self::event_key(event, Some(&session_id))?;
         let legacy_event_key = Self::event_key(event, None)?;
         let mut connection = self.connect()?;
@@ -953,6 +965,10 @@ impl Store {
         });
         let mut payload = Map::new();
         payload.insert("project".to_owned(), Value::String(project.clone()));
+        payload.insert(
+            "thread_id".to_owned(),
+            Value::String(failure.thread_id.to_owned()),
+        );
         payload.insert("error".to_owned(), Value::String(error_message));
         payload.insert(
             "created_at".to_owned(),
@@ -1291,6 +1307,25 @@ impl Store {
                 },
             )
             .optional()?)
+    }
+
+    pub fn add_favorite_directory(&self, path: &str) -> StoreResult<()> {
+        self.connect()?.execute(
+            "INSERT INTO favorite_directories(path, updated_at) VALUES (?1, ?2) \
+             ON CONFLICT(path) DO UPDATE SET updated_at = excluded.updated_at",
+            params![path, now_seconds()],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_favorite_directories(&self) -> StoreResult<Vec<String>> {
+        let connection = self.connect()?;
+        let mut statement = connection.prepare(
+            "SELECT path FROM favorite_directories ORDER BY updated_at DESC, path ASC LIMIT 20",
+        )?;
+        Ok(statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn get_due_outbox(&self) -> StoreResult<Option<OutboxItem>> {
@@ -1684,7 +1719,9 @@ mod tests {
             store.get_last_reply(None, None).unwrap().unwrap().content,
             "完整内容🙂"
         );
-        assert_eq!(store.get_due_outbox().unwrap().unwrap().kind, "final_reply");
+        let outbox = store.get_due_outbox().unwrap().unwrap();
+        assert_eq!(outbox.kind, "final_reply");
+        assert_eq!(outbox.payload["thread_id"], "session-1");
     }
 
     #[test]
@@ -1803,5 +1840,10 @@ mod tests {
             .update_qq_task_state("thread-1", "turn-1", "completed")
             .unwrap();
         assert_eq!(store.count_running_qq_tasks().unwrap(), 0);
+        store.add_favorite_directory(r"E:\work").unwrap();
+        assert_eq!(
+            store.list_favorite_directories().unwrap(),
+            vec![r"E:\work".to_owned()]
+        );
     }
 }

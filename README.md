@@ -28,7 +28,9 @@ CodexBot 是一个面向 Windows 的本地 QQ 控制桥。它让 Codex 在电脑
 - AppSecret 保存在 Windows Credential Manager，不写入仓库、SQLite 或日志。
 - QQ Keyboard 按钮不可用时自动退化为文字命令菜单。
 - 可动态选择 Codex 当前提供的模型和推理强度，并记住上次配置。
+- 可浏览本机磁盘、收藏常用目录，并在任务详情查看最新输出或最终错误。
 - QQ 创建的任务与 Codex Desktop 共享任务历史，最多同时运行 3 个 QQ 任务。
+- 完成和最终失败通知附带“查看任务、继续任务、新建任务”快捷按钮。
 - 仅绑定一个 QQ 用户；不开放独立终端、文件管理器或远程桌面。
 
 > [!CAUTION]

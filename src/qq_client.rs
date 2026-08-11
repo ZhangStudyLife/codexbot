@@ -20,8 +20,9 @@ use crate::control_session::ControlSession;
 use crate::delivery::{DeliveryOutcome, RateLimiter, deliver_item};
 use crate::logging_utils::ProcessSafeLogger;
 use crate::processes::{discover_running_codex_host, process_matches};
+use crate::qq_menu::task_notification_keyboard;
 use crate::security::{Credentials, redact_secrets};
-use crate::store::{Store, StoreError};
+use crate::store::{OutboxItem, Store, StoreError};
 
 pub const HOSTLESS_STARTUP_GRACE: Duration = Duration::from_secs(15);
 pub const DEFAULT_MONITOR_INTERVAL: Duration = Duration::from_secs(1);
@@ -307,6 +308,39 @@ fn safe_detail(value: &str) -> String {
         .collect()
 }
 
+fn notification_keyboard(item: &OutboxItem) -> Option<Value> {
+    let thread_id = item.payload.get("thread_id")?.as_str()?;
+    matches!(
+        item.kind.as_str(),
+        "final_reply" | "turn_ended_without_reply" | "turn_failed"
+    )
+    .then(|| task_notification_keyboard(thread_id, true))
+}
+
+async fn post_proactive_message(
+    api: QQApiClient,
+    keyboard_supported: Arc<AtomicBool>,
+    target: String,
+    text: String,
+    keyboard: Option<Value>,
+) -> Result<(), QQApiError> {
+    if keyboard_supported.load(Ordering::Acquire) {
+        if let Some(keyboard) = keyboard.as_ref() {
+            match api
+                .post_c2c_message(&target, &text, None, Some(keyboard))
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error) if error.is_permanent() => {
+                    keyboard_supported.store(false, Ordering::Release);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    api.post_c2c_message(&target, &text, None, None).await
+}
+
 struct RuntimeState {
     stop: AtomicBool,
     ready: AtomicBool,
@@ -499,6 +533,8 @@ impl QQRuntime {
                 continue;
             };
             let api = self.api.clone();
+            let keyboard = notification_keyboard(&item);
+            let keyboard_supported = self.keyboard_supported.clone();
             let outcome = deliver_item(
                 &self.store,
                 &item,
@@ -507,7 +543,12 @@ impl QQRuntime {
                     let api = api.clone();
                     let target = target.to_owned();
                     let text = text.to_owned();
-                    async move { api.post_c2c_message(&target, &text, None, None).await }
+                    let keyboard = keyboard.clone();
+                    let keyboard_supported = keyboard_supported.clone();
+                    async move {
+                        post_proactive_message(api, keyboard_supported, target, text, keyboard)
+                            .await
+                    }
                 },
                 &self.limiter,
             )
@@ -557,6 +598,8 @@ impl QQRuntime {
                 }
             };
             let api = self.api.clone();
+            let keyboard = notification_keyboard(&item);
+            let keyboard_supported = self.keyboard_supported.clone();
             let outcome = tokio::time::timeout(
                 remaining,
                 deliver_item(
@@ -567,7 +610,12 @@ impl QQRuntime {
                         let api = api.clone();
                         let target = target.to_owned();
                         let text = text.to_owned();
-                        async move { api.post_c2c_message(&target, &text, None, None).await }
+                        let keyboard = keyboard.clone();
+                        let keyboard_supported = keyboard_supported.clone();
+                        async move {
+                            post_proactive_message(api, keyboard_supported, target, text, keyboard)
+                                .await
+                        }
                     },
                     &self.limiter,
                 ),
@@ -986,6 +1034,27 @@ mod tests {
         let keyboard = json!({"content": {"rows": []}});
         let payload = c2c_message_payload("menu", None, Some(&keyboard));
         assert_eq!(payload["keyboard"], keyboard);
+    }
+
+    #[test]
+    fn terminal_notifications_include_task_actions() {
+        let item = OutboxItem {
+            id: 1,
+            event_key: "event".into(),
+            kind: "turn_failed".into(),
+            session_id: "scoped".into(),
+            turn_id: Some("turn".into()),
+            payload: json!({"thread_id": "thread-1"}),
+            segments: None,
+            segment_index: 0,
+            attempts: 0,
+            created_at: 0.0,
+        };
+        let keyboard = notification_keyboard(&item).unwrap();
+        assert_eq!(
+            keyboard["content"]["rows"][0]["buttons"][0]["action"]["data"],
+            "/task thread-1"
+        );
     }
 
     #[tokio::test]

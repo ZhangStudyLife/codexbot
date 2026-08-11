@@ -8,7 +8,14 @@
 
 CodexBot 是一个面向 Windows 的本地通知桥。它让 Codex 在电脑上继续工作，并把“本轮已结束”或“本轮最终失败”发送到你的 QQ，适合长任务、离开电脑和上游服务不稳定的场景。
 
-本仓库基于 [LeaningLearner/codexbot](https://github.com/LeaningLearner/codexbot) 修改，重点增加了 Codex App Server 最终失败监控，并将 QQ 端收敛为单用户通知模式。
+> [!IMPORTANT]
+> **源码来源与版权声明**
+>
+> 本仓库不是从零编写，也不是通过 GitHub 的 Fork 按钮建立；代码直接基于原作者 **LeaningLearner** 的开源项目 [LeaningLearner/codexbot](https://github.com/LeaningLearner/codexbot) 继续修改，并保留了原项目 Git 历史。
+>
+> 原项目采用 MIT License，原始版权声明 `Copyright (c) 2026 LeaningLearner` 已完整保留在 [LICENSE](LICENSE) 中。本修改版由 ZhangStudyLife 独立维护，不代表原作者官方发布、认可或提供支持。详细来源和修改范围见 [NOTICE](NOTICE)。
+
+本修改版主要增加 Codex App Server 最终失败监控，将 QQ 端收敛为单用户通知模式，并补充中文部署及 Windows Release 安装包。除这些修改外，大量项目结构、QQ 通信、Hooks、SQLite、安装和运行代码均来源于上述原项目及其贡献者。
 
 ## 功能特点
 
@@ -33,7 +40,7 @@ CodexBot 是一个面向 Windows 的本地通知桥。它让 Codex 在电脑上�
 
 此方式不需要安装 Rust。
 
-1. 从 [Releases](https://github.com/ZhangStudyLife/codexbot/releases/latest) 下载 `codexbot-windows-x64.zip`。
+1. 从 [Releases](https://github.com/ZhangStudyLife/codexbot/releases/latest) 下载 `codexbot-windows-x64.zip`。压缩包中的 `NOTICE` 和 `LICENSE` 说明了代码来源与许可。
 2. 完整解压压缩包，不要直接在压缩包预览窗口内运行。
 3. 在解压目录中运行：
 
@@ -187,4 +194,4 @@ py -3.11 "$env:USERPROFILE\.codex\skills\.system\plugin-creator\scripts\validate
 
 ## License
 
-[MIT](LICENSE)。原项目版权声明保留在 LICENSE 中。
+[MIT](LICENSE)。本项目直接基于 [LeaningLearner/codexbot](https://github.com/LeaningLearner/codexbot) 修改；原作者版权声明、修改版归属和免责声明见 [NOTICE](NOTICE)。

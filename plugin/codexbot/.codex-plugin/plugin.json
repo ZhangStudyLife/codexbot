@@ -1,15 +1,19 @@
 {
   "name": "codexbot",
-  "version": "0.1.1",
-  "description": "Send Codex completion and final failure notifications to one official QQ sandbox user.",
+  "version": "0.1.2",
+  "description": "A modified LeaningLearner/codexbot distribution for QQ completion and final failure notifications.",
   "author": {
-    "name": "ZhangStudyLife"
+    "name": "LeaningLearner contributors; modifications by ZhangStudyLife",
+    "url": "https://github.com/LeaningLearner/codexbot"
   },
+  "homepage": "https://github.com/ZhangStudyLife/codexbot",
+  "repository": "https://github.com/ZhangStudyLife/codexbot",
+  "license": "MIT",
   "keywords": ["codex", "qq", "notifications", "hooks"],
   "interface": {
     "displayName": "CodexBot QQ Notifications",
     "shortDescription": "Send Codex completion and failure alerts to QQ.",
-    "longDescription": "A local Windows companion that reports completed turns and terminal failures through the official QQ bot sandbox.",
+    "longDescription": "A modified distribution based directly on LeaningLearner/codexbot. It reports completed turns and terminal failures through the official QQ bot sandbox.",
     "defaultPrompt": "Use Codex normally; this plugin only sends read-only completion and terminal failure notifications to the paired QQ sandbox user.",
     "developerName": "ZhangStudyLife",
     "category": "Productivity",

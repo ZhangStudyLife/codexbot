@@ -1,0 +1,51 @@
+CodexBot Source and Attribution Notice
+======================================
+
+Upstream source
+---------------
+
+This repository is a modified distribution based directly on:
+
+    CodexBot
+    https://github.com/LeaningLearner/codexbot
+
+Original project author and copyright holder:
+
+    LeaningLearner
+    Copyright (c) 2026 LeaningLearner
+
+The upstream project is licensed under the MIT License. Its original copyright
+and license text are preserved in the LICENSE file distributed with this
+repository and its release packages.
+
+Modifications in this distribution
+----------------------------------
+
+Modifications maintained by ZhangStudyLife include:
+
+- monitoring the Codex App Server for terminal failed turn states;
+- QQ notifications for final failures such as capacity, HTTP 429 and HTTP 503;
+- notification-only QQ commands and reduced proactive message content;
+- Windows x64 release packaging and Chinese deployment documentation.
+
+The repository retains upstream Git history. Significant portions of the
+project architecture, QQ integration, lifecycle Hooks, SQLite storage,
+installation logic and runtime code originate from the upstream project and
+its contributors.
+
+Independent maintenance
+-----------------------
+
+This repository was published independently instead of through GitHub's Fork
+button. It is not an official release of the upstream author, and no upstream
+endorsement, warranty or support is implied. Issues concerning modifications
+in this repository should be reported to ZhangStudyLife rather than to the
+upstream author unless they also reproduce in the upstream project.
+
+中文说明
+--------
+
+本仓库不是从零编写，而是直接基于原作者 LeaningLearner 的开源项目
+https://github.com/LeaningLearner/codexbot 继续修改。原项目使用 MIT License，
+原始版权声明已完整保留在 LICENSE 中。本修改版由 ZhangStudyLife 独立维护，
+不代表原作者官方发布、认可或提供支持。

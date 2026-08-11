@@ -101,12 +101,14 @@ impl ControlSession {
             || command.starts_with("/retry ")
             || command.starts_with("/steer ")
             || command.starts_with("/stop ")
+            || command.starts_with("/chat")
             || command.starts_with("/ui ")
             || command == "/cancel"
         {
             return true;
         }
         self.wizard.lock().await.active()
+            || self.store.get_active_qq_thread().ok().flatten().is_some()
     }
 
     pub async fn handle(&self, openid: &str, content: &str) -> MenuReply {
@@ -117,7 +119,7 @@ impl ControlSession {
         }
         let command = normalize(content);
         let result = if command == "/menu" {
-            self.menu()
+            self.exit_chat()
         } else if command == "/new" {
             self.begin_new().await
         } else if command == "/tasks" || command.starts_with("/tasks ") {
@@ -132,6 +134,12 @@ impl ControlSession {
             self.await_steer(arguments).await
         } else if let Some(arguments) = command.strip_prefix("/stop ") {
             self.stop_task(arguments).await
+        } else if command == "/chat exit" {
+            self.exit_chat()
+        } else if command == "/chat switch" {
+            self.switch_chat().await
+        } else if let Some(thread_id) = command.strip_prefix("/chat ") {
+            self.enter_chat(thread_id.trim()).await
         } else if command == "/cancel" {
             self.wizard.lock().await.reset();
             self.menu()
@@ -156,6 +164,16 @@ impl ControlSession {
 
     fn menu(&self) -> Result<MenuReply, ControlError> {
         Ok(main_menu(self.store.count_running_qq_tasks()?))
+    }
+
+    fn exit_chat(&self) -> Result<MenuReply, ControlError> {
+        self.store.set_active_qq_thread(None)?;
+        self.menu()
+    }
+
+    async fn switch_chat(&self) -> Result<MenuReply, ControlError> {
+        self.store.set_active_qq_thread(None)?;
+        self.tasks(false).await
     }
 
     async fn begin_new(&self) -> Result<MenuReply, ControlError> {
@@ -246,7 +264,13 @@ impl ControlSession {
                 self.steer_task(&thread_id, &turn_id, content).await
             }
             Stage::Confirm => Ok(MenuReply::text("请点击“启动任务”，或发送 /cancel。")),
-            Stage::Idle => self.menu(),
+            Stage::Idle => {
+                if let Some(thread_id) = self.store.get_active_qq_thread()? {
+                    self.chat_input(&thread_id, content).await
+                } else {
+                    self.menu()
+                }
+            }
         }
     }
 
@@ -421,15 +445,11 @@ impl ControlSession {
             .await?;
         self.store.set_setting("qq_last_model", &model)?;
         self.store.set_setting("qq_last_effort", &effort)?;
-        Ok(MenuReply::menu(
-            format!("任务已启动\n任务 ID：{}\n工作目录：{}", task.thread_id, cwd),
-            vec![
-                vec![MenuButton::new(
-                    "查看任务",
-                    format!("/task {}", task.thread_id),
-                )],
-                vec![MenuButton::new("返回主菜单", "/menu")],
-            ],
+        self.store.set_active_qq_thread(Some(&task.thread_id))?;
+        Ok(running_chat_reply(
+            &task.thread_id,
+            &task.turn_id,
+            format!("任务已启动，已进入对话。\n工作目录：{cwd}"),
         ))
     }
 
@@ -465,7 +485,7 @@ impl ControlSession {
         let buttons = threads
             .iter()
             .map(|thread| {
-                MenuButton::new(shorten(&thread.preview, 22), format!("/task {}", thread.id))
+                MenuButton::new(shorten(&thread.preview, 22), format!("/chat {}", thread.id))
             })
             .collect::<Vec<_>>();
         let mut rows = button_rows(buttons, 2);
@@ -475,7 +495,10 @@ impl ControlSession {
 
     async fn task_detail(&self, thread_id: &str) -> Result<MenuReply, ControlError> {
         let thread = self.codex.read_thread(thread_id).await?;
-        let mut rows = Vec::new();
+        let mut rows = vec![vec![MenuButton::new(
+            "进入对话",
+            format!("/chat {}", thread.id),
+        )]];
         if matches!(thread.status.as_str(), "active" | "inProgress") {
             if let Some(turn_id) = thread.turn_id.as_deref() {
                 rows.push(vec![
@@ -503,6 +526,54 @@ impl ControlSession {
             MenuButton::new("任务列表", "/tasks"),
         ]);
         Ok(MenuReply::menu(task_text(&thread), rows))
+    }
+
+    async fn enter_chat(&self, thread_id: &str) -> Result<MenuReply, ControlError> {
+        let thread = match self.codex.read_thread(thread_id).await {
+            Ok(thread) => thread,
+            Err(error) => {
+                self.store.set_active_qq_thread(None)?;
+                return Err(error);
+            }
+        };
+        self.wizard.lock().await.reset();
+        self.store.set_active_qq_thread(Some(&thread.id))?;
+        Ok(chat_reply(
+            &thread,
+            "已进入对话，直接发送文字即可继续 Codex。",
+        ))
+    }
+
+    async fn chat_input(&self, thread_id: &str, prompt: &str) -> Result<MenuReply, ControlError> {
+        if prompt.is_empty() {
+            return Ok(MenuReply::text("消息不能为空。"));
+        }
+        let thread = match self.codex.read_thread(thread_id).await {
+            Ok(thread) => thread,
+            Err(error) => {
+                self.store.set_active_qq_thread(None)?;
+                return Err(error);
+            }
+        };
+        if matches!(thread.status.as_str(), "active" | "inProgress") {
+            let turn_id = thread
+                .turn_id
+                .as_deref()
+                .ok_or(ControlError::InvalidResponse("active turn"))?;
+            self.codex.steer(thread_id, turn_id, prompt).await?;
+            Ok(running_chat_reply(
+                thread_id,
+                turn_id,
+                "已追加到当前运行回合。",
+            ))
+        } else {
+            let task = self.codex.continue_task(thread_id, prompt).await?;
+            Ok(running_chat_reply(
+                &task.thread_id,
+                &task.turn_id,
+                "消息已发送，Codex 正在处理。",
+            ))
+        }
     }
 
     async fn await_continue(&self, thread_id: &str) -> Result<MenuReply, ControlError> {
@@ -686,6 +757,49 @@ fn task_text(thread: &ThreadInfo) -> String {
     text
 }
 
+fn chat_reply(thread: &ThreadInfo, message: &str) -> MenuReply {
+    let mut rows = vec![vec![
+        MenuButton::new("刷新", format!("/chat {}", thread.id)),
+        MenuButton::new("任务详情", format!("/task {}", thread.id)),
+    ]];
+    if matches!(thread.status.as_str(), "active" | "inProgress") {
+        if let Some(turn_id) = thread.turn_id.as_deref() {
+            rows.push(vec![MenuButton::new(
+                "停止任务",
+                format!("/stop {} {}", thread.id, turn_id),
+            )]);
+        }
+    }
+    rows.push(vec![
+        MenuButton::new("切换对话", "/chat switch"),
+        MenuButton::new("退出对话", "/chat exit"),
+    ]);
+    MenuReply::menu(
+        format!(
+            "{message}\n\n当前对话：{}\n状态：{}",
+            shorten(&thread.preview, 80),
+            status_text(&thread.status)
+        ),
+        rows,
+    )
+}
+
+fn running_chat_reply(thread_id: &str, turn_id: &str, message: impl Into<String>) -> MenuReply {
+    MenuReply::menu(
+        message,
+        vec![
+            vec![
+                MenuButton::new("刷新", format!("/chat {thread_id}")),
+                MenuButton::new("停止任务", format!("/stop {thread_id} {turn_id}")),
+            ],
+            vec![
+                MenuButton::new("切换对话", "/chat switch"),
+                MenuButton::new("退出对话", "/chat exit"),
+            ],
+        ],
+    )
+}
+
 fn button_rows(buttons: Vec<MenuButton>, per_row: usize) -> Vec<Vec<MenuButton>> {
     buttons
         .chunks(per_row.max(1))
@@ -802,5 +916,25 @@ mod tests {
             .collect();
         let rows = button_rows(buttons, 2);
         assert_eq!(rows.iter().map(Vec::len).collect::<Vec<_>>(), [2, 2, 1]);
+    }
+
+    #[test]
+    fn chat_reply_includes_persistent_controls() {
+        let thread = ThreadInfo {
+            id: "thread-1".into(),
+            cwd: r"E:\work".into(),
+            preview: "修复项目".into(),
+            status: "inProgress".into(),
+            updated_at: 1,
+            turn_id: Some("turn-1".into()),
+            last_output: None,
+            last_prompt: None,
+            error: None,
+        };
+        let reply = chat_reply(&thread, "已进入");
+        let fallback = reply.fallback_text();
+        assert!(fallback.contains("/stop thread-1 turn-1"));
+        assert!(fallback.contains("/chat switch"));
+        assert!(fallback.contains("/chat exit"));
     }
 }

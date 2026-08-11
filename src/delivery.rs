@@ -199,7 +199,7 @@ fn notification_stamp(item: &OutboxItem) -> String {
         .unwrap_or_else(|| "00:00:00".to_owned())
 }
 
-pub fn notification_text(item: &OutboxItem) -> Result<String, DeliveryError> {
+pub fn notification_text(item: &OutboxItem, full_reply: bool) -> Result<String, DeliveryError> {
     let stamp = notification_stamp(item);
     let project = payload_text(&item.payload, "project", "unknown");
     match item.kind.as_str() {
@@ -212,6 +212,10 @@ pub fn notification_text(item: &OutboxItem) -> Result<String, DeliveryError> {
             "⏳ Codex 出现权限请求\n项目：{project}\n工具：{}\n原因：{}\n请在 Codex 中完成审批；如果已启用自动审批且任务继续，此消息可忽略。QQ 不能直接审批。",
             payload_text(&item.payload, "tool", "unknown"),
             payload_text(&item.payload, "reason", "需要确认的操作")
+        )),
+        "final_reply" if full_reply => Ok(format!(
+            "✅ Codex 回复\n项目：{project}\n\n{}",
+            payload_text(&item.payload, "content", "（没有可显示的回复）")
         )),
         "final_reply" => Ok(format!(
             "✅ Codex 本轮已结束\n项目：{project}\n回复 /last 查看结果"
@@ -250,11 +254,12 @@ pub async fn deliver_item<F, Fut, T, E>(
     store: &Store,
     item: &OutboxItem,
     openid: &str,
+    full_reply: bool,
     mut sender: F,
     limiter: &RateLimiter,
 ) -> Result<DeliveryOutcome, DeliveryError>
 where
-    F: FnMut(&str, &str) -> Fut,
+    F: FnMut(&str, &str, bool) -> Fut,
     Fut: Future<Output = Result<T, E>>,
     E: StdError + Send + Sync + 'static,
 {
@@ -266,7 +271,7 @@ where
     let mut segments = match &item.segments {
         Some(segments) => segments.clone(),
         None => {
-            let segments = split_text(&notification_text(item)?, DEFAULT_CHUNK_SIZE)?;
+            let segments = split_text(&notification_text(item, full_reply)?, DEFAULT_CHUNK_SIZE)?;
             store.prepare_segments(item.id, &segments)?;
             segments
         }
@@ -283,7 +288,7 @@ where
 
     let rendered = render_segment(&segments, index)?;
     limiter.wait().await;
-    if let Err(error) = sender(openid, &rendered).await {
+    if let Err(error) = sender(openid, &rendered, index + 1 >= segments.len()).await {
         let category = classify_delivery_error(&error);
         let safe_error = redact_secrets(&error.to_string());
         match category {
@@ -374,7 +379,7 @@ mod tests {
             created_at: 1.0,
         };
 
-        let text = notification_text(&item).unwrap();
+        let text = notification_text(&item, false).unwrap();
         assert!(text.contains("回复 /last 查看结果"));
         assert!(!text.contains("完整敏感回复"));
     }
@@ -394,7 +399,11 @@ mod tests {
             created_at: 1.0,
         };
 
-        assert!(notification_text(&item).unwrap().contains("可能中断或失败"));
+        assert!(
+            notification_text(&item, false)
+                .unwrap()
+                .contains("可能中断或失败")
+        );
     }
 
     #[test]
@@ -418,7 +427,7 @@ mod tests {
             created_at: 1.0,
         };
 
-        let text = notification_text(&item).unwrap();
+        let text = notification_text(&item, false).unwrap();
         assert!(text.contains("❌ Codex 本轮失败"));
         assert!(text.contains("类型：responseTooManyFailedAttempts"));
         assert!(text.contains("HTTP：503"));
@@ -428,8 +437,30 @@ mod tests {
             "error": "unknown failure",
             "created_at": 1.0
         });
-        let text = notification_text(&item).unwrap();
+        let text = notification_text(&item, false).unwrap();
         assert!(!text.contains("类型："));
         assert!(!text.contains("HTTP："));
+    }
+
+    #[test]
+    fn active_chat_completion_contains_the_full_reply() {
+        let item = OutboxItem {
+            id: 1,
+            event_key: "event".to_owned(),
+            kind: "final_reply".to_owned(),
+            session_id: "session".to_owned(),
+            turn_id: Some("turn".to_owned()),
+            payload: serde_json::json!({
+                "project": "demo",
+                "content": "完整回复",
+                "created_at": 1.0,
+            }),
+            segments: None,
+            segment_index: 0,
+            attempts: 0,
+            created_at: 1.0,
+        };
+
+        assert!(notification_text(&item, true).unwrap().contains("完整回复"));
     }
 }

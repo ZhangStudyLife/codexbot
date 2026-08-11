@@ -1050,6 +1050,18 @@ impl Store {
         Ok(())
     }
 
+    pub fn get_active_qq_thread(&self) -> StoreResult<Option<String>> {
+        self.get_setting("qq_active_thread")
+    }
+
+    pub fn set_active_qq_thread(&self, thread_id: Option<&str>) -> StoreResult<()> {
+        if let Some(thread_id) = thread_id {
+            self.set_setting("qq_active_thread", thread_id)
+        } else {
+            self.delete_settings(["qq_active_thread"])
+        }
+    }
+
     pub fn delete_settings<I, S>(&self, keys: I) -> StoreResult<()>
     where
         I: IntoIterator<Item = S>,
@@ -1845,5 +1857,21 @@ mod tests {
             store.list_favorite_directories().unwrap(),
             vec![r"E:\work".to_owned()]
         );
+    }
+
+    #[test]
+    fn active_qq_thread_persists_until_cleared() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("state.sqlite3");
+        let store = Store::new(path.clone()).unwrap();
+        store.set_active_qq_thread(Some("thread-1")).unwrap();
+
+        let reopened = Store::new(path).unwrap();
+        assert_eq!(
+            reopened.get_active_qq_thread().unwrap().as_deref(),
+            Some("thread-1")
+        );
+        reopened.set_active_qq_thread(None).unwrap();
+        assert_eq!(reopened.get_active_qq_thread().unwrap(), None);
     }
 }

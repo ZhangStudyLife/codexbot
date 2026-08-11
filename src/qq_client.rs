@@ -20,7 +20,7 @@ use crate::control_session::ControlSession;
 use crate::delivery::{DeliveryOutcome, RateLimiter, deliver_item};
 use crate::logging_utils::ProcessSafeLogger;
 use crate::processes::{discover_running_codex_host, process_matches};
-use crate::qq_menu::task_notification_keyboard;
+use crate::qq_menu::{chat_notification_keyboard, task_notification_keyboard};
 use crate::security::{Credentials, redact_secrets};
 use crate::store::{OutboxItem, Store, StoreError};
 
@@ -314,13 +314,19 @@ fn safe_detail(value: &str) -> String {
         .collect()
 }
 
-fn notification_keyboard(item: &OutboxItem) -> Option<Value> {
+fn notification_keyboard(item: &OutboxItem, active_chat: bool) -> Option<Value> {
     let thread_id = item.payload.get("thread_id")?.as_str()?;
     matches!(
         item.kind.as_str(),
         "final_reply" | "turn_ended_without_reply" | "turn_failed"
     )
-    .then(|| task_notification_keyboard(thread_id, true))
+    .then(|| {
+        if active_chat {
+            chat_notification_keyboard(thread_id)
+        } else {
+            task_notification_keyboard(thread_id, true)
+        }
+    })
 }
 
 async fn post_proactive_message(
@@ -539,17 +545,20 @@ impl QQRuntime {
                 continue;
             };
             let api = self.api.clone();
-            let keyboard = notification_keyboard(&item);
+            let active_chat = self.store.get_active_qq_thread()?.as_deref()
+                == item.payload.get("thread_id").and_then(Value::as_str);
+            let keyboard = notification_keyboard(&item, active_chat);
             let keyboard_supported = self.keyboard_supported.clone();
             let outcome = deliver_item(
                 &self.store,
                 &item,
                 &openid,
-                move |target, text| {
+                active_chat && item.kind == "final_reply",
+                move |target, text, is_last| {
                     let api = api.clone();
                     let target = target.to_owned();
                     let text = text.to_owned();
-                    let keyboard = keyboard.clone();
+                    let keyboard = if is_last { keyboard.clone() } else { None };
                     let keyboard_supported = keyboard_supported.clone();
                     async move {
                         post_proactive_message(api, keyboard_supported, target, text, keyboard)
@@ -604,7 +613,16 @@ impl QQRuntime {
                 }
             };
             let api = self.api.clone();
-            let keyboard = notification_keyboard(&item);
+            let active_chat = match self.store.get_active_qq_thread() {
+                Ok(thread_id) => {
+                    thread_id.as_deref() == item.payload.get("thread_id").and_then(Value::as_str)
+                }
+                Err(error) => {
+                    self.log_error(&format!("Shutdown chat state read failed: {error}"));
+                    return;
+                }
+            };
+            let keyboard = notification_keyboard(&item, active_chat);
             let keyboard_supported = self.keyboard_supported.clone();
             let outcome = tokio::time::timeout(
                 remaining,
@@ -612,11 +630,12 @@ impl QQRuntime {
                     &self.store,
                     &item,
                     &openid,
-                    move |target, text| {
+                    active_chat && item.kind == "final_reply",
+                    move |target, text, is_last| {
                         let api = api.clone();
                         let target = target.to_owned();
                         let text = text.to_owned();
-                        let keyboard = keyboard.clone();
+                        let keyboard = if is_last { keyboard.clone() } else { None };
                         let keyboard_supported = keyboard_supported.clone();
                         async move {
                             post_proactive_message(api, keyboard_supported, target, text, keyboard)
@@ -1059,10 +1078,31 @@ mod tests {
             attempts: 0,
             created_at: 0.0,
         };
-        let keyboard = notification_keyboard(&item).unwrap();
+        let keyboard = notification_keyboard(&item, false).unwrap();
         assert_eq!(
             keyboard["content"]["rows"][0]["buttons"][0]["action"]["data"],
-            "/task thread-1"
+            "/chat thread-1"
+        );
+    }
+
+    #[test]
+    fn active_chat_notifications_keep_chat_controls() {
+        let item = OutboxItem {
+            id: 1,
+            event_key: "event".into(),
+            kind: "final_reply".into(),
+            session_id: "scoped".into(),
+            turn_id: Some("turn".into()),
+            payload: json!({"thread_id": "thread-1"}),
+            segments: None,
+            segment_index: 0,
+            attempts: 0,
+            created_at: 0.0,
+        };
+        let keyboard = notification_keyboard(&item, true).unwrap();
+        assert_eq!(
+            keyboard["content"]["rows"][1]["buttons"][1]["action"]["data"],
+            "/chat exit"
         );
     }
 

@@ -94,14 +94,33 @@ pub fn main_menu(running: usize) -> MenuReply {
 }
 
 pub fn task_notification_keyboard(thread_id: &str, can_continue: bool) -> Value {
-    let mut first_row = vec![MenuButton::new("查看任务", format!("/task {thread_id}"))];
+    let mut first_row = vec![MenuButton::new("进入对话", format!("/chat {thread_id}"))];
     if can_continue {
         first_row.push(MenuButton::new(
-            "继续任务",
+            "单次继续",
             format!("/continue {thread_id}"),
         ));
     }
-    keyboard(vec![first_row, vec![MenuButton::new("新建任务", "/new")]])
+    keyboard(vec![
+        first_row,
+        vec![
+            MenuButton::new("查看任务", format!("/task {thread_id}")),
+            MenuButton::new("新建任务", "/new"),
+        ],
+    ])
+}
+
+pub fn chat_notification_keyboard(thread_id: &str) -> Value {
+    keyboard(vec![
+        vec![
+            MenuButton::new("刷新", format!("/chat {thread_id}")),
+            MenuButton::new("任务详情", format!("/task {thread_id}")),
+        ],
+        vec![
+            MenuButton::new("切换对话", "/chat switch"),
+            MenuButton::new("退出对话", "/chat exit"),
+        ],
+    ])
 }
 
 pub fn keyboard(rows: Vec<Vec<MenuButton>>) -> Value {
@@ -151,5 +170,18 @@ mod tests {
     fn text_fallback_preserves_every_action() {
         let reply = MenuReply::menu("菜单", vec![vec![MenuButton::new("新建任务", "/new")]]);
         assert!(reply.fallback_text().contains("新建任务：/new"));
+    }
+
+    #[test]
+    fn chat_keyboard_keeps_the_current_thread() {
+        let value = chat_notification_keyboard("thread-1");
+        assert_eq!(
+            value["content"]["rows"][0]["buttons"][0]["action"]["data"],
+            "/chat thread-1"
+        );
+        assert_eq!(
+            value["content"]["rows"][1]["buttons"][1]["action"]["data"],
+            "/chat exit"
+        );
     }
 }

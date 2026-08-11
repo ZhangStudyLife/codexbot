@@ -4,9 +4,9 @@
 
 <h1 align="center">CodexBot</h1>
 
-<p align="center">Codex 完成或最终失败时，通过 QQ 官方机器人通知你。</p>
+<p align="center">通过 QQ 官方机器人接收 Codex 通知，并远程创建、查看和继续本机任务。</p>
 
-CodexBot 是一个面向 Windows 的本地通知桥。它让 Codex 在电脑上继续工作，并把“本轮已结束”或“本轮最终失败”发送到你的 QQ，适合长任务、离开电脑和上游服务不稳定的场景。
+CodexBot 是一个面向 Windows 的本地 QQ 控制桥。它让 Codex 在电脑上继续工作，把“本轮已结束”或“本轮最终失败”发送到你的 QQ，并提供按钮式文字控制台来创建、查看、继续、追加引导和停止任务。
 
 > [!IMPORTANT]
 > **源码来源与版权声明**
@@ -15,7 +15,7 @@ CodexBot 是一个面向 Windows 的本地通知桥。它让 Codex 在电脑上�
 >
 > 原项目采用 MIT License，原始版权声明 `Copyright (c) 2026 LeaningLearner` 已完整保留在 [LICENSE](LICENSE) 中。本修改版由 ZhangStudyLife 独立维护，不代表原作者官方发布、认可或提供支持。详细来源和修改范围见 [NOTICE](NOTICE)。
 
-本修改版主要增加 Codex App Server 最终失败监控，将 QQ 端收敛为单用户通知模式，并补充中文部署及 Windows Release 安装包。除这些修改外，大量项目结构、QQ 通信、Hooks、SQLite、安装和运行代码均来源于上述原项目及其贡献者。
+本修改版主要增加 Codex App Server 最终失败监控、QQ 单用户远程控制台，并补充中文部署及 Windows Release 安装包。除这些修改外，大量项目结构、QQ 通信、Hooks、SQLite、安装和运行代码均来源于上述原项目及其贡献者。
 
 ## 功能特点
 
@@ -26,7 +26,13 @@ CodexBot 是一个面向 Windows 的本地通知桥。它让 Codex 在电脑上�
 - 约每 2 秒检查一次最终状态，按 `thread_id + turn_id` 幂等去重。
 - 首次启动只建立基线，不补发历史失败；重启后使用 60 秒重叠窗口补漏。
 - AppSecret 保存在 Windows Credential Manager，不写入仓库、SQLite 或日志。
-- 仅绑定一个 QQ 用户；不支持通过 QQ 执行任意命令、批准操作或控制本机文件。
+- QQ Keyboard 按钮不可用时自动退化为文字命令菜单。
+- 可动态选择 Codex 当前提供的模型和推理强度，并记住上次配置。
+- QQ 创建的任务与 Codex Desktop 共享任务历史，最多同时运行 3 个 QQ 任务。
+- 仅绑定一个 QQ 用户；不开放独立终端、文件管理器或远程桌面。
+
+> [!CAUTION]
+> QQ 创建的 Codex 任务使用 `approvalPolicy: never` 和 `danger-full-access`，能够读写整台电脑并执行命令。绑定 QQ 账号或机器人凭据失守等同于整机控制权限失守。请只绑定自己的 QQ，不要共享 AppSecret，并为 QQ 账号启用可靠的登录保护。
 
 ## 环境要求
 
@@ -102,6 +108,11 @@ cd codexbot
 | 命令 | 作用 |
 | --- | --- |
 | `/bind XXXX-XXXX` | 使用一次性配对码绑定当前 QQ |
+| `/menu` | 打开按钮式 Codex 远程控制台 |
+| `/new` | 新建全盘权限 Codex 任务 |
+| `/tasks [running]` | 查看全部任务或只看运行中任务 |
+| `/task 任务ID` | 查看任务详情和可用操作 |
+| `/continue 任务ID` | 继续一个已结束任务 |
 | `/status` | 查看最近的 Codex 项目和状态 |
 | `/last [项目] [页码]` | 分页查看最近回复 |
 | `/mute` | 暂停后续主动通知 |

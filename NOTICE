@@ -25,7 +25,9 @@ Modifications maintained by ZhangStudyLife include:
 
 - monitoring the Codex App Server for terminal failed turn states;
 - QQ notifications for final failures such as capacity, HTTP 429 and HTTP 503;
-- notification-only QQ commands and reduced proactive message content;
+- a single-user QQ text console for creating and controlling Codex tasks;
+- dynamic model/reasoning selection and full-access App Server task execution;
+- reduced proactive notification content;
 - Windows x64 release packaging and Chinese deployment documentation.
 
 The repository retains upstream Git history. Significant portions of the

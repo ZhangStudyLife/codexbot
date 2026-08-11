@@ -96,6 +96,17 @@ pub struct TurnFailureNotification<'a> {
     pub occurred_at: f64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct QQTaskInfo {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub cwd: String,
+    pub model: String,
+    pub effort: String,
+    pub state: String,
+    pub updated_at: f64,
+}
+
 #[derive(Debug, Clone)]
 pub struct Store {
     pub path: PathBuf,
@@ -290,6 +301,16 @@ impl Store {
             CREATE TABLE IF NOT EXISTS inbound_messages (
                 message_id TEXT PRIMARY KEY,
                 created_at REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS qq_tasks (
+                thread_id TEXT PRIMARY KEY,
+                turn_id TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                model TEXT NOT NULL,
+                effort TEXT NOT NULL,
+                state TEXT NOT NULL,
+                updated_at REAL NOT NULL
             );
             "#,
         )?;
@@ -1207,6 +1228,71 @@ impl Store {
         )? == 1)
     }
 
+    pub fn upsert_qq_task(&self, task: &QQTaskInfo) -> StoreResult<()> {
+        self.connect()?.execute(
+            "INSERT INTO qq_tasks(thread_id, turn_id, cwd, model, effort, state, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT(thread_id) DO UPDATE SET turn_id = excluded.turn_id, \
+             cwd = excluded.cwd, model = excluded.model, effort = excluded.effort, \
+             state = excluded.state, updated_at = excluded.updated_at",
+            params![
+                task.thread_id,
+                task.turn_id,
+                task.cwd,
+                task.model,
+                task.effort,
+                task.state,
+                task.updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_qq_task_state(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        state: &str,
+    ) -> StoreResult<()> {
+        self.connect()?.execute(
+            "UPDATE qq_tasks SET state = ?3, updated_at = ?4 \
+             WHERE thread_id = ?1 AND turn_id = ?2",
+            params![thread_id, turn_id, state, now_seconds()],
+        )?;
+        Ok(())
+    }
+
+    pub fn count_running_qq_tasks(&self) -> StoreResult<usize> {
+        let count: i64 = self.connect()?.query_row(
+            "SELECT COUNT(*) FROM qq_tasks WHERE state = 'active'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(usize::try_from(count).unwrap_or_default())
+    }
+
+    pub fn get_qq_task(&self, thread_id: &str) -> StoreResult<Option<QQTaskInfo>> {
+        Ok(self
+            .connect()?
+            .query_row(
+                "SELECT thread_id, turn_id, cwd, model, effort, state, updated_at \
+                 FROM qq_tasks WHERE thread_id = ?1",
+                [thread_id],
+                |row| {
+                    Ok(QQTaskInfo {
+                        thread_id: row.get(0)?,
+                        turn_id: row.get(1)?,
+                        cwd: row.get(2)?,
+                        model: row.get(3)?,
+                        effort: row.get(4)?,
+                        state: row.get(5)?,
+                        updated_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
     pub fn get_due_outbox(&self) -> StoreResult<Option<OutboxItem>> {
         self.get_due_outbox_at(now_seconds())
     }
@@ -1283,7 +1369,8 @@ impl Store {
         if self.pairing_status()?.0 {
             return Ok(true);
         }
-        Ok(self.get_bound_openid()?.is_some() && self.has_pending_outbox()?)
+        Ok(self.get_bound_openid()?.is_some()
+            && (self.has_pending_outbox()? || self.count_running_qq_tasks()? > 0))
     }
 
     pub fn prepare_segments(&self, item_id: i64, segments: &[String]) -> StoreResult<()> {
@@ -1692,5 +1779,29 @@ mod tests {
 
         store.record_host(&host).unwrap();
         assert_eq!(store.list_hosts().unwrap(), vec![host]);
+    }
+
+    #[test]
+    fn qq_task_state_drives_concurrency_and_daemon_lifetime() {
+        let root = tempdir().unwrap();
+        let store = Store::new(root.path().join("state.sqlite3")).unwrap();
+        store.set_setting("bound_openid", "owner").unwrap();
+        let task = QQTaskInfo {
+            thread_id: "thread-1".into(),
+            turn_id: "turn-1".into(),
+            cwd: r"E:\work".into(),
+            model: "gpt-test".into(),
+            effort: "high".into(),
+            state: "active".into(),
+            updated_at: 1.0,
+        };
+
+        store.upsert_qq_task(&task).unwrap();
+        assert_eq!(store.count_running_qq_tasks().unwrap(), 1);
+        assert!(store.companion_work_pending().unwrap());
+        store
+            .update_qq_task_state("thread-1", "turn-1", "completed")
+            .unwrap();
+        assert_eq!(store.count_running_qq_tasks().unwrap(), 0);
     }
 }

@@ -534,6 +534,25 @@ impl CodexAppServerSession {
         std::mem::take(&mut self.notifications)
     }
 
+    pub async fn pump_notification(
+        &mut self,
+        wait: Duration,
+    ) -> Result<Option<Value>, AppServerError> {
+        let deadline = Instant::now() + wait.max(Duration::from_millis(1));
+        let message = match self.read_message(deadline).await {
+            Ok(message) => message,
+            Err(AppServerError::Timeout(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if !message.contains_key("id") && message.contains_key("method") {
+            return Ok(Some(Value::Object(message)));
+        }
+        if let Some(response_id) = message.get("id").and_then(Value::as_u64) {
+            self.pending.insert(response_id, Value::Object(message));
+        }
+        Ok(None)
+    }
+
     pub async fn request(
         &mut self,
         method: &str,

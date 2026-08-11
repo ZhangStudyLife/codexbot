@@ -20,6 +20,9 @@ use crate::security::redact_secrets;
 use crate::store::{Store, StoreError};
 
 pub const HELP_TEXT: &str = "CodexBot QQ 命令\n\
+/menu - 打开 QQ 文字版 Codex 控制台\n\
+/new - 新建全盘权限 Codex 任务\n\
+/tasks [running] - 查看全部或运行中的任务\n\
 /bind 配对码 - 首次绑定或使用新配对码换绑\n\
 /status - 查看 Codex 当前状态\n\
 /last [项目] [页码] - 查看最近回复；只写页码时保持兼容\n\
@@ -214,7 +217,7 @@ impl CommandService {
                     .await
                     .is_ok();
             let response = if active_ok {
-                "绑定成功，主动通知能力正常。"
+                "绑定成功，主动通知能力正常。发送 /menu 打开远程控制台。"
             } else {
                 "绑定已完成，但主动通知测试失败。请在 QQ 中开启“允许主动发送”，再用 /status 检查。"
             };

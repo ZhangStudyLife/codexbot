@@ -14,7 +14,9 @@ use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::codex_control::CodexControlRuntime;
 use crate::commands::CommandService;
+use crate::control_session::ControlSession;
 use crate::delivery::{DeliveryOutcome, RateLimiter, deliver_item};
 use crate::logging_utils::ProcessSafeLogger;
 use crate::processes::{discover_running_codex_host, process_matches};
@@ -97,6 +99,13 @@ impl fmt::Display for QQApiError {
 }
 
 impl StdError for QQApiError {}
+
+impl QQApiError {
+    fn is_permanent(&self) -> bool {
+        self.status
+            .is_some_and(|status| (400..500).contains(&status))
+    }
+}
 
 #[derive(Debug, Clone)]
 struct AccessToken {
@@ -216,13 +225,14 @@ impl QQApiClient {
         openid: &str,
         content: &str,
         reply_to: Option<(&str, u32)>,
+        keyboard: Option<&Value>,
     ) -> Result<(), QQApiError> {
         let token = self.access_token().await.map_err(|error| QQApiError {
             code: None,
             status: None,
             message: safe_detail(&error.to_string()),
         })?;
-        let payload = c2c_message_payload(content, reply_to);
+        let payload = c2c_message_payload(content, reply_to, keyboard);
         let response = self
             .http
             .post(format!("{QQ_API_BASE}/v2/users/{openid}/messages"))
@@ -250,11 +260,18 @@ impl QQApiClient {
     }
 }
 
-fn c2c_message_payload(content: &str, reply_to: Option<(&str, u32)>) -> Value {
+fn c2c_message_payload(
+    content: &str,
+    reply_to: Option<(&str, u32)>,
+    keyboard: Option<&Value>,
+) -> Value {
     let mut payload = json!({"msg_type": 0, "content": content});
     if let (Some(payload), Some((message_id, sequence))) = (payload.as_object_mut(), reply_to) {
         payload.insert("msg_id".to_owned(), Value::String(message_id.to_owned()));
         payload.insert("msg_seq".to_owned(), Value::from(sequence));
+    }
+    if let (Some(payload), Some(keyboard)) = (payload.as_object_mut(), keyboard) {
+        payload.insert("keyboard".to_owned(), keyboard.clone());
     }
     payload
 }
@@ -322,7 +339,9 @@ pub struct QQRuntime {
     store: Arc<Store>,
     logger: ProcessSafeLogger,
     commands: CommandService,
+    control: ControlSession,
     api: QQApiClient,
+    keyboard_supported: Arc<AtomicBool>,
     limiter: RateLimiter,
     options: QQRuntimeOptions,
     state: Arc<RuntimeState>,
@@ -345,11 +364,14 @@ impl QQRuntime {
         logger: ProcessSafeLogger,
         options: QQRuntimeOptions,
     ) -> Result<Self, QQRuntimeError> {
+        let codex = CodexControlRuntime::new(store.clone());
         Ok(Self {
             commands: CommandService::new(store.clone()),
+            control: ControlSession::new(store.clone(), codex),
             store,
             logger,
             api: QQApiClient::new(credentials)?,
+            keyboard_supported: Arc::new(AtomicBool::new(true)),
             limiter: RateLimiter::default(),
             options,
             state: Arc::new(RuntimeState::new()),
@@ -485,7 +507,7 @@ impl QQRuntime {
                     let api = api.clone();
                     let target = target.to_owned();
                     let text = text.to_owned();
-                    async move { api.post_c2c_message(&target, &text, None).await }
+                    async move { api.post_c2c_message(&target, &text, None, None).await }
                 },
                 &self.limiter,
             )
@@ -545,7 +567,7 @@ impl QQRuntime {
                         let api = api.clone();
                         let target = target.to_owned();
                         let text = text.to_owned();
-                        async move { api.post_c2c_message(&target, &text, None).await }
+                        async move { api.post_c2c_message(&target, &text, None, None).await }
                     },
                     &self.limiter,
                 ),
@@ -596,6 +618,62 @@ impl QQRuntime {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
+        if self.control.should_handle(&content).await {
+            match self.store.remember_inbound(&message_id) {
+                Ok(false) => return,
+                Err(error) => {
+                    self.log_error(&format!(
+                        "QQ control deduplication failed: {}",
+                        safe_detail(&error.to_string())
+                    ));
+                    return;
+                }
+                Ok(true) => {}
+            }
+            let reply = self.control.handle(&openid, &content).await;
+            let keyboard = self.keyboard_supported.load(Ordering::Acquire);
+            let attempted_keyboard = keyboard && reply.keyboard.is_some();
+            if attempted_keyboard {
+                match self
+                    .api
+                    .post_c2c_message(
+                        &openid,
+                        &reply.text,
+                        Some((&message_id, 1)),
+                        reply.keyboard.as_ref(),
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        self.log_info("Handled QQ control command with keyboard");
+                        return;
+                    }
+                    Err(error) if error.is_permanent() => {
+                        self.keyboard_supported.store(false, Ordering::Release);
+                        self.log_warning(
+                            "QQ keyboard was rejected permanently; falling back to text commands",
+                        );
+                    }
+                    Err(error) => self.log_warning(&format!(
+                        "QQ keyboard send failed; falling back to text: {}",
+                        safe_detail(&error.to_string())
+                    )),
+                }
+            }
+            let fallback = reply.fallback_text();
+            let sequence = if attempted_keyboard { 2 } else { 1 };
+            if let Err(error) = self
+                .api
+                .post_c2c_message(&openid, &fallback, Some((&message_id, sequence)), None)
+                .await
+            {
+                self.log_error(&format!(
+                    "QQ control reply failed: {}",
+                    safe_detail(&error.to_string())
+                ));
+            }
+            return;
+        }
         let passive_api = self.api.clone();
         let active_api = self.api.clone();
         match self
@@ -607,13 +685,13 @@ impl QQRuntime {
                 move |target, text, source_id, sequence| {
                     let api = passive_api.clone();
                     async move {
-                        api.post_c2c_message(&target, &text, Some((&source_id, sequence)))
+                        api.post_c2c_message(&target, &text, Some((&source_id, sequence)), None)
                             .await
                     }
                 },
                 move |target, text| {
                     let api = active_api.clone();
-                    async move { api.post_c2c_message(&target, &text, None).await }
+                    async move { api.post_c2c_message(&target, &text, None, None).await }
                 },
             )
             .await
@@ -623,6 +701,18 @@ impl QQRuntime {
                 "QQ command failed: {}",
                 safe_detail(&error.to_string())
             )),
+        }
+    }
+
+    async fn control_pump(self) {
+        while !self.is_stopping() {
+            if let Err(error) = self.control.pump_once().await {
+                self.log_warning(&format!(
+                    "Codex control session disconnected: {}",
+                    safe_detail(&error.to_string())
+                ));
+            }
+            self.interruptible_sleep(Duration::from_millis(200)).await;
         }
     }
 
@@ -721,6 +811,7 @@ impl QQRuntime {
 
     pub async fn run(&self) -> Result<(), QQRuntimeError> {
         let mut monitor = tokio::spawn(self.clone().monitor_hosts());
+        let control_pump = tokio::spawn(self.clone().control_pump());
         let mut monitor_completed = false;
         let mut reconnect_delay = self.options.initial_reconnect_delay;
         let result = loop {
@@ -799,6 +890,10 @@ impl QQRuntime {
             }
             let _ = monitor.await;
         }
+        if !control_pump.is_finished() {
+            control_pump.abort();
+        }
+        let _ = control_pump.await;
         self.commands.shutdown().await;
         result
     }
@@ -872,7 +967,7 @@ mod tests {
 
     #[test]
     fn passive_reply_payload_includes_qq_deduplication_sequence() {
-        let payload = c2c_message_payload("help", Some(("message-1", 1)));
+        let payload = c2c_message_payload("help", Some(("message-1", 1)), None);
         assert_eq!(payload["msg_type"], 0);
         assert_eq!(payload["content"], "help");
         assert_eq!(payload["msg_id"], "message-1");
@@ -881,9 +976,16 @@ mod tests {
 
     #[test]
     fn proactive_payload_has_no_passive_reply_fields() {
-        let payload = c2c_message_payload("notice", None);
+        let payload = c2c_message_payload("notice", None, None);
         assert!(payload.get("msg_id").is_none());
         assert!(payload.get("msg_seq").is_none());
+    }
+
+    #[test]
+    fn keyboard_payload_is_attached_to_c2c_message() {
+        let keyboard = json!({"content": {"rows": []}});
+        let payload = c2c_message_payload("menu", None, Some(&keyboard));
+        assert_eq!(payload["keyboard"], keyboard);
     }
 
     #[tokio::test]

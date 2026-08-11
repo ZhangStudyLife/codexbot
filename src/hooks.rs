@@ -12,7 +12,7 @@ use std::env;
 use std::io::{Read, Write};
 
 pub const ANCESTOR_PIDS_ENV: &str = "CODEXBOT_HOOK_ANCESTOR_PIDS";
-pub const HOOK_PAYLOAD_MAX_BYTES: usize = 128 * 1024;
+pub const HOOK_PAYLOAD_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 fn parse_ancestor_pids(raw: &str) -> Vec<u32> {
     let mut seen = HashSet::new();
@@ -109,5 +109,14 @@ mod tests {
     fn hook_payload_reader_is_bounded() {
         let input = vec![b'x'; HOOK_PAYLOAD_MAX_BYTES + 1];
         assert!(read_hook_payload(&mut &input[..]).is_err());
+    }
+
+    #[test]
+    fn hook_payload_reader_accepts_the_new_limit() {
+        let input = vec![b'x'; HOOK_PAYLOAD_MAX_BYTES];
+        assert_eq!(
+            read_hook_payload(&mut &input[..]).unwrap().len(),
+            HOOK_PAYLOAD_MAX_BYTES
+        );
     }
 }

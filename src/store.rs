@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -26,6 +26,7 @@ pub const SESSION_SCOPE_VERSION: &str = "2";
 pub const SESSION_SCOPE_VERSION_KEY: &str = "session_scope_version";
 pub const SESSION_KEY_PREFIX: &str = "v2:";
 pub const TRANSCRIPT_METADATA_MAX_BYTES: usize = 64 * 1024;
+pub const TRANSCRIPT_FINAL_REPLY_SCAN_BYTES: u64 = 1024 * 1024;
 
 const SUBAGENT_LIFECYCLE_EVENTS: &[&str] = &["SubagentStart", "SubagentStop"];
 const SUBAGENT_IDENTITY_FIELDS: &[&str] = &["agent_id", "agent_type", "agent_transcript_path"];
@@ -555,7 +556,7 @@ impl Store {
                 );
             }
             "Stop" => {
-                let answer = py_string(object.get("last_assistant_message"), "");
+                let answer = Self::stop_answer(object);
                 identity.insert(
                     "answer_hash".to_owned(),
                     Value::String(sha256_hex(answer.as_bytes())),
@@ -715,6 +716,80 @@ impl Store {
             || source_is_subagent
     }
 
+    fn stop_answer(event: &Map<String, Value>) -> String {
+        let answer = py_string(event.get("last_assistant_message"), "");
+        if !answer.is_empty() {
+            return answer;
+        }
+        let Some(path) = event
+            .get("transcript_path")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return String::new();
+        };
+        let turn_id = py_string(event.get("turn_id"), "");
+        if turn_id.is_empty() {
+            return String::new();
+        }
+        let Ok(mut file) = File::open(path) else {
+            return String::new();
+        };
+        let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+            return String::new();
+        };
+        let offset = length.saturating_sub(TRANSCRIPT_FINAL_REPLY_SCAN_BYTES);
+        if file.seek(SeekFrom::Start(offset)).is_err() {
+            return String::new();
+        }
+        let mut bytes = Vec::new();
+        if file.read_to_end(&mut bytes).is_err() {
+            return String::new();
+        }
+        let lines = if offset == 0 {
+            bytes.as_slice()
+        } else {
+            bytes
+                .splitn(2, |byte| *byte == b'\n')
+                .nth(1)
+                .unwrap_or_default()
+        };
+
+        let mut answer = String::new();
+        for line in lines.split(|byte| *byte == b'\n') {
+            let Ok(record) = serde_json::from_slice::<Value>(line) else {
+                continue;
+            };
+            let Some(payload) = record.get("payload").and_then(Value::as_object) else {
+                continue;
+            };
+            if record.get("type").and_then(Value::as_str) != Some("response_item")
+                || payload.get("type").and_then(Value::as_str) != Some("message")
+                || payload.get("role").and_then(Value::as_str) != Some("assistant")
+                || payload
+                    .get("internal_chat_message_metadata_passthrough")
+                    .and_then(Value::as_object)
+                    .and_then(|metadata| metadata.get("turn_id"))
+                    .and_then(Value::as_str)
+                    != Some(turn_id.as_str())
+            {
+                continue;
+            }
+            let text = payload
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("output_text"))
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<String>();
+            if !text.trim().is_empty() {
+                answer = text;
+            }
+        }
+        answer
+    }
+
     pub fn ingest_hook(&self, event: &Value, host: Option<&HostProcess>) -> StoreResult<bool> {
         self.ingest_hook_at(event, host, now_seconds())
     }
@@ -784,7 +859,7 @@ impl Store {
             "PostToolUse" => status = "running".to_owned(),
             "Stop" => {
                 status = "completed".to_owned();
-                let answer = py_string(object.get("last_assistant_message"), "");
+                let answer = Self::stop_answer(object);
                 if answer.is_empty() {
                     kind = Some("turn_ended_without_reply");
                     payload = Some(serde_json::json!({
@@ -1762,6 +1837,43 @@ mod tests {
             "turn_ended_without_reply"
         );
         assert!(store.get_last_reply(None, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn empty_stop_uses_matching_assistant_transcript_reply() {
+        let root = tempdir().unwrap();
+        let transcript = root.path().join("session.jsonl");
+        let other_turn = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "不要发送"}],
+                "internal_chat_message_metadata_passthrough": {"turn_id": "turn-other"},
+            },
+        });
+        let planned_reply = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "<proposed_plan>计划正文</proposed_plan>"}],
+                "internal_chat_message_metadata_passthrough": {"turn_id": "turn-1"},
+            },
+        });
+        std::fs::write(&transcript, format!("{}\n{}\n", other_turn, planned_reply)).unwrap();
+
+        let store = Store::new(root.path().join("state.sqlite3")).unwrap();
+        let mut stop = event("Stop");
+        stop["transcript_path"] = Value::String(transcript.display().to_string());
+        assert!(store.ingest_hook(&stop, None).unwrap());
+
+        let outbox = store.get_due_outbox().unwrap().unwrap();
+        assert_eq!(outbox.kind, "final_reply");
+        assert_eq!(
+            outbox.payload["content"],
+            "<proposed_plan>计划正文</proposed_plan>"
+        );
     }
 
     #[test]

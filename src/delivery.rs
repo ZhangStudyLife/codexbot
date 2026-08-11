@@ -214,10 +214,34 @@ pub fn notification_text(item: &OutboxItem) -> Result<String, DeliveryError> {
             payload_text(&item.payload, "reason", "需要确认的操作")
         )),
         "final_reply" => Ok(format!(
-            "✅ Codex 已完成\n项目：{project}\n模型：{}\n\n{}",
-            payload_text(&item.payload, "model", "unknown"),
-            payload_text(&item.payload, "content", "")
+            "✅ Codex 本轮已结束\n项目：{project}\n回复 /last 查看结果"
         )),
+        "turn_ended_without_reply" => Ok(format!(
+            "⚠️ Codex 本轮结束但没有最终回复，可能中断或失败，请回电脑检查\n项目：{project}"
+        )),
+        "turn_failed" => {
+            let mut text = format!(
+                "❌ Codex 本轮失败\n项目：{project}\n错误：{}",
+                payload_text(&item.payload, "error", "Codex 请求失败")
+            );
+            if let Some(error_type) = item
+                .payload
+                .get("error_type")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                text.push_str(&format!("\n类型：{error_type}"));
+            }
+            if let Some(http_status) = item.payload.get("http_status").and_then(|value| {
+                value
+                    .as_u64()
+                    .map(|value| value.to_string())
+                    .or_else(|| value.as_str().map(str::to_owned))
+            }) {
+                text.push_str(&format!("\nHTTP：{http_status}"));
+            }
+            Ok(text)
+        }
         kind => Err(DeliveryError::UnknownKind(kind.to_owned())),
     }
 }
@@ -328,5 +352,84 @@ mod tests {
             classify_delivery_error_text("40054013 user 拒收"),
             DeliveryErrorCategory::Permanent
         );
+    }
+
+    #[test]
+    fn completion_notification_does_not_include_the_final_reply() {
+        let item = OutboxItem {
+            id: 1,
+            event_key: "event".to_owned(),
+            kind: "final_reply".to_owned(),
+            session_id: "session".to_owned(),
+            turn_id: Some("turn".to_owned()),
+            payload: serde_json::json!({
+                "project": "demo",
+                "model": "gpt",
+                "content": "完整敏感回复",
+                "created_at": 1.0,
+            }),
+            segments: None,
+            segment_index: 0,
+            attempts: 0,
+            created_at: 1.0,
+        };
+
+        let text = notification_text(&item).unwrap();
+        assert!(text.contains("回复 /last 查看结果"));
+        assert!(!text.contains("完整敏感回复"));
+    }
+
+    #[test]
+    fn missing_reply_notification_requests_attention() {
+        let item = OutboxItem {
+            id: 1,
+            event_key: "event".to_owned(),
+            kind: "turn_ended_without_reply".to_owned(),
+            session_id: "session".to_owned(),
+            turn_id: Some("turn".to_owned()),
+            payload: serde_json::json!({"project": "demo", "created_at": 1.0}),
+            segments: None,
+            segment_index: 0,
+            attempts: 0,
+            created_at: 1.0,
+        };
+
+        assert!(notification_text(&item).unwrap().contains("可能中断或失败"));
+    }
+
+    #[test]
+    fn failure_notification_includes_only_available_details() {
+        let mut item = OutboxItem {
+            id: 1,
+            event_key: "event".to_owned(),
+            kind: "turn_failed".to_owned(),
+            session_id: "session".to_owned(),
+            turn_id: Some("turn".to_owned()),
+            payload: serde_json::json!({
+                "project": "demo",
+                "error": "service unavailable",
+                "error_type": "responseTooManyFailedAttempts",
+                "http_status": 503,
+                "created_at": 1.0
+            }),
+            segments: None,
+            segment_index: 0,
+            attempts: 0,
+            created_at: 1.0,
+        };
+
+        let text = notification_text(&item).unwrap();
+        assert!(text.contains("❌ Codex 本轮失败"));
+        assert!(text.contains("类型：responseTooManyFailedAttempts"));
+        assert!(text.contains("HTTP：503"));
+
+        item.payload = serde_json::json!({
+            "project": "demo",
+            "error": "unknown failure",
+            "created_at": 1.0
+        });
+        let text = notification_text(&item).unwrap();
+        assert!(!text.contains("类型："));
+        assert!(!text.contains("HTTP："));
     }
 }

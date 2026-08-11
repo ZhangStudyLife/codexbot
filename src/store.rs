@@ -85,6 +85,17 @@ pub struct LastReply {
     pub created_at: f64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct TurnFailureNotification<'a> {
+    pub thread_id: &'a str,
+    pub cwd: &'a str,
+    pub turn_id: &'a str,
+    pub error_message: &'a str,
+    pub error_type: Option<&'a str>,
+    pub http_status: Option<u16>,
+    pub occurred_at: f64,
+}
+
 #[derive(Debug, Clone)]
 pub struct Store {
     pub path: PathBuf,
@@ -728,13 +739,6 @@ impl Store {
             "UserPromptSubmit" => {
                 status = "running".to_owned();
                 preview = Some(prompt_preview(&py_string(object.get("prompt"), ""), 120));
-                kind = Some("task_started");
-                payload = Some(serde_json::json!({
-                    "project": project,
-                    "model": model,
-                    "preview": preview,
-                    "created_at": now,
-                }));
             }
             "PermissionRequest" => {
                 status = "running".to_owned();
@@ -755,7 +759,14 @@ impl Store {
             "Stop" => {
                 status = "completed".to_owned();
                 let answer = py_string(object.get("last_assistant_message"), "");
-                if !answer.is_empty() {
+                if answer.is_empty() {
+                    kind = Some("turn_ended_without_reply");
+                    payload = Some(serde_json::json!({
+                        "project": project,
+                        "model": model,
+                        "created_at": now,
+                    }));
+                } else {
                     kind = Some("final_reply");
                     payload = Some(serde_json::json!({
                         "project": project,
@@ -839,7 +850,7 @@ impl Store {
             false
         };
 
-        if event_name == "Stop" && payload.is_some() && !existing_event {
+        if event_name == "Stop" && kind == Some("final_reply") && !existing_event {
             let content = payload
                 .as_ref()
                 .and_then(|value| value.get("content"))
@@ -895,6 +906,91 @@ impl Store {
                 )? == 1;
             }
         }
+        transaction.commit()?;
+        Ok(inserted)
+    }
+
+    pub fn enqueue_turn_failure(&self, failure: TurnFailureNotification<'_>) -> StoreResult<bool> {
+        let session_id = Self::scoped_session_id(failure.thread_id, failure.cwd, None);
+        let project = Self::project_name(failure.cwd);
+        let event_key = format!("turn_failed:{}:{}", failure.thread_id, failure.turn_id);
+        let error_message: String = redact_secrets(failure.error_message)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(500)
+            .collect();
+        let error_type = failure.error_type.map(|value| {
+            redact_secrets(value)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(120)
+                .collect::<String>()
+        });
+        let mut payload = Map::new();
+        payload.insert("project".to_owned(), Value::String(project.clone()));
+        payload.insert("error".to_owned(), Value::String(error_message));
+        payload.insert(
+            "created_at".to_owned(),
+            serde_json::json!(failure.occurred_at),
+        );
+        if let Some(error_type) = error_type.filter(|value| !value.is_empty()) {
+            payload.insert("error_type".to_owned(), Value::String(error_type));
+        }
+        if let Some(http_status) = failure.http_status {
+            payload.insert("http_status".to_owned(), serde_json::json!(http_status));
+        }
+
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction()?;
+        let queued_at = now_seconds();
+        transaction.execute(
+            "INSERT INTO sessions(\
+                 session_id, cwd, project, model, turn_id, status, prompt_preview, updated_at\
+             ) VALUES (?1, ?2, ?3, 'unknown', ?4, 'failed', NULL, ?5) \
+             ON CONFLICT(session_id) DO UPDATE SET \
+                 cwd = excluded.cwd, project = excluded.project, turn_id = excluded.turn_id, \
+                 status = excluded.status, updated_at = excluded.updated_at \
+             WHERE excluded.updated_at >= sessions.updated_at",
+            params![
+                session_id,
+                failure.cwd,
+                project,
+                failure.turn_id,
+                failure.occurred_at
+            ],
+        )?;
+        let muted: Option<String> = transaction
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'muted'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let initial_state = if muted.as_deref() == Some("1") {
+            "suppressed"
+        } else {
+            "pending"
+        };
+        let last_error = (initial_state == "suppressed").then_some("notifications muted");
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO outbox(\
+                 event_key, kind, session_id, turn_id, payload_json, state, created_at, \
+                 next_attempt_at, last_error\
+             ) VALUES (?1, 'turn_failed', ?2, ?3, ?4, ?5, ?6, 0, ?7)",
+            params![
+                event_key,
+                session_id,
+                failure.turn_id,
+                serde_json::to_string(&Value::Object(payload))?,
+                initial_state,
+                queued_at,
+                last_error
+            ],
+        )? == 1;
         transaction.commit()?;
         Ok(inserted)
     }
@@ -1501,6 +1597,65 @@ mod tests {
             store.get_last_reply(None, None).unwrap().unwrap().content,
             "完整内容🙂"
         );
+        assert_eq!(store.get_due_outbox().unwrap().unwrap().kind, "final_reply");
+    }
+
+    #[test]
+    fn prompts_update_status_without_start_notifications() {
+        let root = tempdir().unwrap();
+        let store = Store::new(root.path().join("state.sqlite3")).unwrap();
+        let mut prompt = event("UserPromptSubmit");
+        prompt["prompt"] = Value::String("不要发送到 QQ".to_owned());
+
+        assert!(!store.ingest_hook(&prompt, None).unwrap());
+        assert!(!store.has_pending_outbox().unwrap());
+        assert_eq!(
+            store.get_sessions_for_status().unwrap()[0].status,
+            "running"
+        );
+    }
+
+    #[test]
+    fn empty_stop_queues_warning_without_overwriting_last_reply() {
+        let root = tempdir().unwrap();
+        let store = Store::new(root.path().join("state.sqlite3")).unwrap();
+
+        assert!(store.ingest_hook(&event("Stop"), None).unwrap());
+        assert_eq!(
+            store.get_due_outbox().unwrap().unwrap().kind,
+            "turn_ended_without_reply"
+        );
+        assert!(store.get_last_reply(None, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn turn_failure_preserves_existing_model_and_marks_the_session_failed() {
+        let root = tempdir().unwrap();
+        let store = Store::new(root.path().join("state.sqlite3")).unwrap();
+        let mut prompt = event("UserPromptSubmit");
+        prompt["prompt"] = Value::String("test".to_owned());
+        store.ingest_hook_at(&prompt, None, 100.0).unwrap();
+
+        assert!(
+            store
+                .enqueue_turn_failure(TurnFailureNotification {
+                    thread_id: "session-1",
+                    cwd: r"D:\work\示例项目",
+                    turn_id: "failed-turn",
+                    error_message: "service unavailable",
+                    error_type: Some("serverOverloaded"),
+                    http_status: Some(503),
+                    occurred_at: 200.0,
+                })
+                .unwrap()
+        );
+        let session = &store.get_sessions_for_status().unwrap()[0];
+        assert_eq!(session.status, "failed");
+        assert_eq!(session.model, "gpt-5.6-codex");
+        let item = store.get_due_outbox_at(200.0).unwrap().unwrap();
+        assert_eq!(item.kind, "turn_failed");
+        assert_eq!(item.payload["http_status"], 503);
+        assert!(item.created_at > 200.0);
     }
 
     #[test]

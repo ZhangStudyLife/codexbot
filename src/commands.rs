@@ -23,15 +23,12 @@ pub const HELP_TEXT: &str = "CodexBot QQ 命令\n\
 /bind 配对码 - 首次绑定或使用新配对码换绑\n\
 /status - 查看 Codex 当前状态\n\
 /last [项目] [页码] - 查看最近回复；只写页码时保持兼容\n\
-/usage - 查看 Codex 各限额剩余百分比和重置时间\n\
-/account - 查看当前 Codex 账号\n\
-/account save 名称 - 保存当前 Codex 账号\n\
-/account list - 列出 codex_login 账号和加密快照\n\
-/account use 序号/名称/邮箱/ID - 关闭 Codex、切换账号并自动重新打开\n\
-/account delete 名称 - 删除已保存的账号\n\
 /mute - 暂停主动通知\n\
 /unmute - 恢复主动通知\n\
 /help - 显示此帮助";
+
+const EXTENDED_COMMANDS_ENABLED: bool = false;
+const EXTENDED_COMMANDS_DISABLED_TEXT: &str = "该命令在通知模式下未启用。";
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -242,13 +239,15 @@ impl CommandService {
         let lower = command.to_lowercase();
         let response = if lower == "/status" {
             status_text(&self.store)?
-        } else if lower == "/usage" {
+        } else if EXTENDED_COMMANDS_ENABLED && lower == "/usage" {
             self.usage_text().await
-        } else if lower == "/account" {
+        } else if EXTENDED_COMMANDS_ENABLED && lower == "/account" {
             self.account_text().await
-        } else if lower.starts_with("/account ") {
+        } else if EXTENDED_COMMANDS_ENABLED && lower.starts_with("/account ") {
             self.account_switch_text(command["/account".len()..].trim())
                 .await
+        } else if lower == "/usage" || lower == "/account" || lower.starts_with("/account ") {
+            EXTENDED_COMMANDS_DISABLED_TEXT.to_owned()
         } else if lower == "/last" || lower.starts_with("/last ") {
             match last_arguments(command.get(5..).unwrap_or_default()) {
                 Some((project, page)) => last_text(&self.store, page, project.as_deref())?,
@@ -777,5 +776,43 @@ mod tests {
         assert_eq!(replies.len(), 2);
         assert!(replies.iter().all(|reply| reply.1 == HELP_TEXT));
         assert!(replies.iter().all(|reply| reply.3 == 1));
+        assert!(!HELP_TEXT.contains("/account"));
+        assert!(!HELP_TEXT.contains("/usage"));
+    }
+
+    #[tokio::test]
+    async fn account_commands_are_rejected_in_notification_mode() {
+        let root = tempdir().unwrap();
+        let store = Arc::new(Store::new(root.path().join("state.sqlite3")).unwrap());
+        store.set_setting("bound_openid", "owner").unwrap();
+        let service = CommandService::new(store);
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&replies);
+
+        let outcome = service
+            .handle(
+                "owner",
+                "message-account",
+                "/account use 1",
+                move |target, text, source_id, sequence| {
+                    let captured = Arc::clone(&captured);
+                    async move {
+                        captured
+                            .lock()
+                            .unwrap()
+                            .push((target, text, source_id, sequence));
+                        Ok::<(), io::Error>(())
+                    }
+                },
+                |_target, _text| async { Ok::<(), io::Error>(()) },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, CommandOutcome::Replied);
+        assert_eq!(
+            replies.lock().unwrap()[0].1,
+            EXTENDED_COMMANDS_DISABLED_TEXT
+        );
     }
 }

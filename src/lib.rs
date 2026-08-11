@@ -20,5 +20,6 @@ pub mod qq_client;
 pub mod security;
 pub mod store;
 pub mod subprocess_utils;
+pub mod turn_monitor;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

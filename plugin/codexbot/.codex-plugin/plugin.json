@@ -1,17 +1,17 @@
 {
   "name": "codexbot",
-  "version": "0.1.0",
-  "description": "Send Codex lifecycle notifications to one official QQ sandbox user.",
+  "version": "0.1.1",
+  "description": "Send Codex completion and final failure notifications to one official QQ sandbox user.",
   "author": {
-    "name": "Local developer"
+    "name": "ZhangStudyLife"
   },
   "keywords": ["codex", "qq", "notifications", "hooks"],
   "interface": {
     "displayName": "CodexBot QQ Notifications",
-    "shortDescription": "Send Codex status and final replies to QQ.",
-    "longDescription": "A local Windows companion that observes the current Codex app through lifecycle hooks and sends read-only notifications through the official QQ bot sandbox.",
-    "defaultPrompt": "Use Codex normally; this plugin only mirrors lifecycle notifications to the paired QQ sandbox user.",
-    "developerName": "Local developer",
+    "shortDescription": "Send Codex completion and failure alerts to QQ.",
+    "longDescription": "A local Windows companion that reports completed turns and terminal failures through the official QQ bot sandbox.",
+    "defaultPrompt": "Use Codex normally; this plugin only sends read-only completion and terminal failure notifications to the paired QQ sandbox user.",
+    "developerName": "ZhangStudyLife",
     "category": "Productivity",
     "capabilities": ["Read", "Notifications"]
   }

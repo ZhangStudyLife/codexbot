@@ -33,6 +33,19 @@ fn safe_detail(value: impl fmt::Display, limit: usize) -> String {
         .collect()
 }
 
+fn initialize_params(experimental_api: bool) -> Value {
+    json!({
+        "clientInfo": {
+            "name": "codexbot",
+            "title": "CodexBot",
+            "version": env!("CARGO_PKG_VERSION")
+        },
+        "capabilities": {
+            "experimentalApi": experimental_api
+        }
+    })
+}
+
 #[derive(Debug, Error)]
 pub enum AppServerError {
     #[error("{0}")]
@@ -254,6 +267,23 @@ impl CodexAppServerClient {
         &self,
         request_timeout: Option<Duration>,
     ) -> Result<CodexAppServerSession, AppServerError> {
+        self.open_session_with_experimental_api(request_timeout, false)
+            .await
+    }
+
+    pub async fn open_experimental_session(
+        &self,
+        request_timeout: Option<Duration>,
+    ) -> Result<CodexAppServerSession, AppServerError> {
+        self.open_session_with_experimental_api(request_timeout, true)
+            .await
+    }
+
+    async fn open_session_with_experimental_api(
+        &self,
+        request_timeout: Option<Duration>,
+        experimental_api: bool,
+    ) -> Result<CodexAppServerSession, AppServerError> {
         let request_timeout = request_timeout
             .unwrap_or(self.timeout)
             .max(Duration::from_millis(100));
@@ -296,7 +326,7 @@ impl CodexAppServerClient {
             timeout: request_timeout,
             _guard: guard,
         };
-        session.initialize().await?;
+        session.initialize(experimental_api).await?;
         Ok(session)
     }
 
@@ -492,22 +522,16 @@ impl CodexAppServerSession {
         self.response_for(request_id, deadline).await
     }
 
-    async fn initialize(&mut self) -> Result<(), AppServerError> {
+    async fn initialize(&mut self, experimental_api: bool) -> Result<(), AppServerError> {
         let deadline = Instant::now() + self.timeout;
-        self.raw_request(
-            "initialize",
-            json!({
-                "clientInfo": {
-                    "name": "codexbot",
-                    "title": "CodexBot",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
-            }),
-            deadline,
-        )
-        .await?;
+        self.raw_request("initialize", initialize_params(experimental_api), deadline)
+            .await?;
         self.send(&json!({"method": "initialized", "params": {}}))
             .await
+    }
+
+    pub fn drain_notifications(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.notifications)
     }
 
     pub async fn request(
@@ -791,5 +815,17 @@ mod tests {
     #[test]
     fn device_login_requires_complete_result() {
         assert!(parse_device_login_result(&json!({"loginId": "x"})).is_err());
+    }
+
+    #[test]
+    fn experimental_sessions_opt_in_during_initialize() {
+        assert_eq!(
+            initialize_params(true)["capabilities"]["experimentalApi"],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            initialize_params(false)["capabilities"]["experimentalApi"],
+            Value::Bool(false)
+        );
     }
 }

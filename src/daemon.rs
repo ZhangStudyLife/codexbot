@@ -7,6 +7,7 @@ use crate::processes::{ensure_daemon, process_matches};
 use crate::qq_client::run_qq_runtime;
 use crate::security::{Credentials, load_credentials, redact_secrets};
 use crate::store::Store;
+use crate::turn_monitor;
 use anyhow::{Context, Result};
 use std::env;
 use std::sync::Arc;
@@ -142,8 +143,13 @@ async fn run_active_daemon(
     let cleanup_task = tokio::spawn(periodic_cleanup(
         Arc::clone(&store),
         logger.clone(),
-        cleanup_receiver,
+        cleanup_receiver.clone(),
         CLEANUP_INTERVAL,
+    ));
+    let monitor_task = tokio::spawn(turn_monitor::run(
+        Arc::clone(&store),
+        logger.clone(),
+        cleanup_receiver,
     ));
 
     let active_result = async {
@@ -171,6 +177,12 @@ async fn run_active_daemon(
     if let Err(error) = cleanup_task.await {
         let _ = logger.error(&format!(
             "Periodic store cleanup task stopped unexpectedly: {}",
+            safe_detail(&error),
+        ));
+    }
+    if let Err(error) = monitor_task.await {
+        let _ = logger.error(&format!(
+            "Turn failure monitor task stopped unexpectedly: {}",
             safe_detail(&error),
         ));
     }

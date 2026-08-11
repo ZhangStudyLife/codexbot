@@ -7,7 +7,7 @@ if defined CODEXBOT_DATA_DIR (
   set "CODEXBOT_EXE=%LOCALAPPDATA%\CodexBot\bin\codexbot.exe"
 )
 if not exist "%CODEXBOT_EXE%" (
-  echo CodexBot 尚未安装，请先运行 install.cmd。
+  echo CodexBot 尚未安装，请先运行 install-release.cmd 或 install.cmd。
   exit /b 1
 )
 "%CODEXBOT_EXE%" %*

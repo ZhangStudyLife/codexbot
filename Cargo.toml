@@ -1,11 +1,11 @@
 [package]
 name = "codexbot"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 description = "A native Codex lifecycle notification bridge for the official QQ bot sandbox"
 license = "MIT"
-repository = "https://github.com/LeaningLearner/codexbot"
+repository = "https://github.com/ZhangStudyLife/codexbot"
 
 [[bin]]
 name = "codexbot"

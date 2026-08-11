@@ -266,13 +266,19 @@ fn c2c_message_payload(
     reply_to: Option<(&str, u32)>,
     keyboard: Option<&Value>,
 ) -> Value {
-    let mut payload = json!({"msg_type": 0, "content": content});
+    let mut payload = if let Some(keyboard) = keyboard {
+        json!({
+            "msg_type": 2,
+            "content": "",
+            "markdown": {"content": content},
+            "keyboard": keyboard
+        })
+    } else {
+        json!({"msg_type": 0, "content": content})
+    };
     if let (Some(payload), Some((message_id, sequence))) = (payload.as_object_mut(), reply_to) {
         payload.insert("msg_id".to_owned(), Value::String(message_id.to_owned()));
         payload.insert("msg_seq".to_owned(), Value::from(sequence));
-    }
-    if let (Some(payload), Some(keyboard)) = (payload.as_object_mut(), keyboard) {
-        payload.insert("keyboard".to_owned(), keyboard.clone());
     }
     payload
 }
@@ -1033,6 +1039,9 @@ mod tests {
     fn keyboard_payload_is_attached_to_c2c_message() {
         let keyboard = json!({"content": {"rows": []}});
         let payload = c2c_message_payload("menu", None, Some(&keyboard));
+        assert_eq!(payload["msg_type"], 2);
+        assert_eq!(payload["content"], "");
+        assert_eq!(payload["markdown"]["content"], "menu");
         assert_eq!(payload["keyboard"], keyboard);
     }
 

@@ -1107,6 +1107,38 @@ impl Store {
         Ok(inserted)
     }
 
+    pub fn enqueue_claude_reply(
+        &self,
+        session_id: &str,
+        cwd: &str,
+        content: &str,
+        failed: bool,
+    ) -> StoreResult<bool> {
+        let scoped = Self::scoped_session_id(session_id, cwd, None);
+        let kind = if failed {
+            "claude_failed"
+        } else {
+            "claude_reply"
+        };
+        let event_key = format!("claude:{}:{}", kind, sha256_hex(content.as_bytes()));
+        let project = Self::project_name(cwd);
+        let payload = serde_json::json!({
+            "project": project,
+            "thread_id": session_id,
+            "content": content,
+            "error": failed.then_some(content),
+            "created_at": now_seconds(),
+        });
+        let muted = self.get_setting("muted")?.as_deref() == Some("1");
+        let state = if muted { "suppressed" } else { "pending" };
+        let connection = self.connect()?;
+        let inserted = connection.execute(
+            "INSERT OR IGNORE INTO outbox(event_key, kind, session_id, turn_id, payload_json, state, created_at, next_attempt_at, last_error) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, 0, ?7)",
+            params![event_key, kind, scoped, serde_json::to_string(&payload)?, state, now_seconds(), muted.then_some("notifications muted")],
+        )? == 1;
+        Ok(inserted)
+    }
+
     pub fn get_setting(&self, key: &str) -> StoreResult<Option<String>> {
         Ok(self
             .connect()?

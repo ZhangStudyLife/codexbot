@@ -62,6 +62,9 @@ enum Command {
     /// Codex 生命周期 Hook 的中性入口。
     #[command(hide = true)]
     Hook,
+    /// Claude Code 生命周期 Hook 的通知入口。
+    #[command(name = "claude-hook", hide = true)]
+    ClaudeHook,
 }
 
 fn now() -> f64 {
@@ -448,6 +451,7 @@ pub async fn run() -> Result<i32> {
         Command::Stop => command_stop(),
         Command::Daemon => crate::daemon::run().await,
         Command::Hook => Ok(command_hook()),
+        Command::ClaudeHook => Ok(crate::claude_hook::run()),
     }
 }
 

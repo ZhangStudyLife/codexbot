@@ -1,6 +1,7 @@
 //! Native Codex lifecycle notifications for the official QQ bot sandbox.
 
 pub mod account_switch;
+pub mod claude_hook;
 pub mod cli;
 pub mod codex_accounts;
 pub mod codex_app;

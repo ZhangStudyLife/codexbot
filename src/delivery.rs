@@ -220,6 +220,16 @@ pub fn notification_text(item: &OutboxItem, full_reply: bool) -> Result<String, 
         "final_reply" => Ok(format!(
             "✅ Codex 本轮已结束\n项目：{project}\n回复 /last 查看结果"
         )),
+        "claude_reply" => Ok(payload_text(
+            &item.payload,
+            "content",
+            "✅ Claude Code 本轮已结束\n（没有可显示的回答）",
+        )),
+        "claude_failed" => Ok(payload_text(
+            &item.payload,
+            "content",
+            "❌ Claude Code 任务失败\n错误：未知错误",
+        )),
         "turn_ended_without_reply" => Ok(format!(
             "⚠️ Codex 本轮结束但没有最终回复，可能中断或失败，请回电脑检查\n项目：{project}"
         )),
@@ -382,6 +392,32 @@ mod tests {
         let text = notification_text(&item, false).unwrap();
         assert!(text.contains("回复 /last 查看结果"));
         assert!(!text.contains("完整敏感回复"));
+    }
+
+    #[test]
+    fn claude_notification_keeps_its_identity_and_full_reply() {
+        let item = OutboxItem {
+            id: 1,
+            event_key: "claude:event".to_owned(),
+            kind: "claude_reply".to_owned(),
+            session_id: "claude-session".to_owned(),
+            turn_id: None,
+            payload: serde_json::json!({
+                "project": "demo",
+                "content": "✅ Claude Code 本轮已结束\n项目：demo\n\n完整回答",
+                "created_at": 1.0,
+            }),
+            segments: None,
+            segment_index: 0,
+            attempts: 0,
+            created_at: 1.0,
+        };
+
+        let text = notification_text(&item, false).unwrap();
+        assert!(text.contains("Claude Code"));
+        assert!(text.contains("完整回答"));
+        assert!(!text.contains("Codex 本轮"));
+        assert!(!text.contains("/last"));
     }
 
     #[test]

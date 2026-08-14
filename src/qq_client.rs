@@ -226,6 +226,7 @@ impl QQApiClient {
         openid: &str,
         content: &str,
         reply_to: Option<(&str, u32)>,
+        markdown: bool,
         keyboard: Option<&Value>,
     ) -> Result<(), QQApiError> {
         let token = self.access_token().await.map_err(|error| QQApiError {
@@ -233,7 +234,7 @@ impl QQApiClient {
             status: None,
             message: safe_detail(&error.to_string()),
         })?;
-        let payload = c2c_message_payload(content, reply_to, keyboard);
+        let payload = c2c_message_payload(content, reply_to, markdown, keyboard);
         let response = self
             .http
             .post(format!("{QQ_API_BASE}/v2/users/{openid}/messages"))
@@ -264,15 +265,19 @@ impl QQApiClient {
 fn c2c_message_payload(
     content: &str,
     reply_to: Option<(&str, u32)>,
+    markdown: bool,
     keyboard: Option<&Value>,
 ) -> Value {
-    let mut payload = if let Some(keyboard) = keyboard {
-        json!({
+    let mut payload = if markdown {
+        let mut payload = json!({
             "msg_type": 2,
             "content": "",
-            "markdown": {"content": content},
-            "keyboard": keyboard
-        })
+            "markdown": {"content": content}
+        });
+        if let (Some(payload), Some(keyboard)) = (payload.as_object_mut(), keyboard) {
+            payload.insert("keyboard".to_owned(), keyboard.clone());
+        }
+        payload
     } else {
         json!({"msg_type": 0, "content": content})
     };
@@ -339,7 +344,7 @@ async fn post_proactive_message(
     if keyboard_supported.load(Ordering::Acquire) {
         if let Some(keyboard) = keyboard.as_ref() {
             match api
-                .post_c2c_message(&target, &text, None, Some(keyboard))
+                .post_c2c_message(&target, &text, None, true, Some(keyboard))
                 .await
             {
                 Ok(()) => return Ok(()),
@@ -350,7 +355,15 @@ async fn post_proactive_message(
             }
         }
     }
-    api.post_c2c_message(&target, &text, None, None).await
+    match api.post_c2c_message(&target, &text, None, true, None).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.is_permanent() => {
+            keyboard_supported.store(false, Ordering::Release);
+            api.post_c2c_message(&target, &text, None, false, None)
+                .await
+        }
+        Err(error) => Err(error),
+    }
 }
 
 struct RuntimeState {
@@ -713,6 +726,7 @@ impl QQRuntime {
                         &openid,
                         &reply.text,
                         Some((&message_id, 1)),
+                        true,
                         reply.keyboard.as_ref(),
                     )
                     .await
@@ -737,7 +751,13 @@ impl QQRuntime {
             let sequence = if attempted_keyboard { 2 } else { 1 };
             if let Err(error) = self
                 .api
-                .post_c2c_message(&openid, &fallback, Some((&message_id, sequence)), None)
+                .post_c2c_message(
+                    &openid,
+                    &fallback,
+                    Some((&message_id, sequence)),
+                    false,
+                    None,
+                )
                 .await
             {
                 self.log_error(&format!(
@@ -758,13 +778,22 @@ impl QQRuntime {
                 move |target, text, source_id, sequence| {
                     let api = passive_api.clone();
                     async move {
-                        api.post_c2c_message(&target, &text, Some((&source_id, sequence)), None)
-                            .await
+                        api.post_c2c_message(
+                            &target,
+                            &text,
+                            Some((&source_id, sequence)),
+                            false,
+                            None,
+                        )
+                        .await
                     }
                 },
                 move |target, text| {
                     let api = active_api.clone();
-                    async move { api.post_c2c_message(&target, &text, None, None).await }
+                    async move {
+                        api.post_c2c_message(&target, &text, None, false, None)
+                            .await
+                    }
                 },
             )
             .await
@@ -1040,7 +1069,7 @@ mod tests {
 
     #[test]
     fn passive_reply_payload_includes_qq_deduplication_sequence() {
-        let payload = c2c_message_payload("help", Some(("message-1", 1)), None);
+        let payload = c2c_message_payload("help", Some(("message-1", 1)), false, None);
         assert_eq!(payload["msg_type"], 0);
         assert_eq!(payload["content"], "help");
         assert_eq!(payload["msg_id"], "message-1");
@@ -1049,7 +1078,7 @@ mod tests {
 
     #[test]
     fn proactive_payload_has_no_passive_reply_fields() {
-        let payload = c2c_message_payload("notice", None, None);
+        let payload = c2c_message_payload("notice", None, false, None);
         assert!(payload.get("msg_id").is_none());
         assert!(payload.get("msg_seq").is_none());
     }
@@ -1057,11 +1086,20 @@ mod tests {
     #[test]
     fn keyboard_payload_is_attached_to_c2c_message() {
         let keyboard = json!({"content": {"rows": []}});
-        let payload = c2c_message_payload("menu", None, Some(&keyboard));
+        let payload = c2c_message_payload("menu", None, true, Some(&keyboard));
         assert_eq!(payload["msg_type"], 2);
         assert_eq!(payload["content"], "");
         assert_eq!(payload["markdown"]["content"], "menu");
         assert_eq!(payload["keyboard"], keyboard);
+    }
+
+    #[test]
+    fn markdown_payload_does_not_require_a_keyboard() {
+        let payload = c2c_message_payload("**完成**", None, true, None);
+        assert_eq!(payload["msg_type"], 2);
+        assert_eq!(payload["content"], "");
+        assert_eq!(payload["markdown"]["content"], "**完成**");
+        assert!(payload.get("keyboard").is_none());
     }
 
     #[test]
@@ -1104,6 +1142,23 @@ mod tests {
             keyboard["content"]["rows"][1]["buttons"][1]["action"]["data"],
             "/chat exit"
         );
+    }
+
+    #[test]
+    fn claude_notifications_have_no_codex_keyboard() {
+        let item = OutboxItem {
+            id: 1,
+            event_key: "claude:event".into(),
+            kind: "claude_reply".into(),
+            session_id: "claude-session".into(),
+            turn_id: None,
+            payload: json!({"thread_id": "claude-session"}),
+            segments: None,
+            segment_index: 0,
+            attempts: 0,
+            created_at: 0.0,
+        };
+        assert!(notification_keyboard(&item, false).is_none());
     }
 
     #[tokio::test]
